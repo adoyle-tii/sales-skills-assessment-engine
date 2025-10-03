@@ -1,17 +1,128 @@
-// sales-coach-worker.js
+// --- TOP-LEVEL ROUTER ---
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    // -------- CORS ----------
     const allowOrigin = (env.ALLOW_ORIGIN && String(env.ALLOW_ORIGIN)) || "*";
-    const headers = new Headers({
-      "Access-Control-Allow-Origin": allowOrigin,
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Content-Type": "application/json",
+
+    // Handle CORS preflight requests (OPTIONS) immediately.
+    // This is the most critical part for fixing the CORS error.
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": allowOrigin,
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      });
+    }
+
+    // Determine which handler to use for the actual request.
+    const url = new URL(request.url);
+    let handler;
+    if (url.pathname === "/pre-assess") {
+      handler = handlePreAssessment;
+    } else {
+      handler = handleFullAssessment;
+    }
+
+    // Call the appropriate handler to get the response.
+    const response = await handler(request, env);
+
+    // Clone the response to make the headers mutable and add CORS headers.
+    // This ensures EVERY response sent back to the browser is CORS-compliant.
+    const newHeaders = new Headers(response.headers);
+    newHeaders.set("Access-Control-Allow-Origin", allowOrigin);
+    
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: newHeaders,
     });
-    if (request.method === "OPTIONS") return new Response(null, { headers });
+  },
+};
+
+// --- PRE-ASSESSMENT HANDLER ---
+async function handlePreAssessment(request, env) {
+  try {
+      const body = await request.json();
+      const { transcript, allSkills } = body;
+      const GEMINI_API_KEY = env.GEMINI_API_KEY;
+      const INDEX_MODEL = (env.INDEX_MODEL || "gemini-2.5-pro").trim();
+
+      if (!transcript || !Array.isArray(allSkills) || allSkills.length === 0) {
+          return new Response(JSON.stringify({ error: "Missing 'transcript' or 'allSkills' in request body." }), { status: 400 });
+      }
+
+      function buildPreAssessmentPrompt(transcript, skillsList) {
+          return `
+          You are an efficient AI analyst. Your task is to review a sales call transcript and determine which predefined skills are demonstrably present in the seller's dialogue.
+
+          Analyze the following transcript. Based on the conversation, identify which of the skills from the provided list are clearly and substantially discussed or demonstrated by the speakers.
+
+          **CRITICAL RULES:**
+          - Only return skills that have significant evidence in the text. Do not include skills that are only briefly mentioned or tangentially related.
+          - Your response MUST be a valid JSON array of strings, containing only the names of the relevant skills from the list.
+          - If no skills are clearly present, return an empty array [].
+
+          **Full List of Possible Skills:**
+          ${JSON.stringify(skillsList, null, 2)}
+
+          **Transcript:**
+          ---
+          ${transcript}
+          ---
+
+          Return ONLY the JSON array.
+          `;
+      }
+
+      const prompt = buildPreAssessmentPrompt(transcript, allSkills);
+
+      const requestBody = {
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+              responseMimeType: "application/json",
+              temperature: 0.0,
+          },
+          safetySettings: [
+              { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+              { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+              { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+              { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+          ],
+      };
+
+      const googleURL = `https://generativelanguage.googleapis.com/v1beta/models/${INDEX_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+      const response = await fetch(googleURL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+      });
+
+      if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`Gemini API Error: ${response.status} ${errorText}`);
+      }
+
+      const result = await response.json();
+      const relevantSkillsText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+      
+      if (!relevantSkillsText) {
+           return new Response(JSON.stringify({ skills: [] }), { headers: { "Content-Type": "application/json" } });
+      }
+
+      const relevantSkills = JSON.parse(relevantSkillsText);
+      return new Response(JSON.stringify({ skills: relevantSkills }), { headers: { "Content-Type": "application/json" } });
+
+  } catch (error) {
+      console.error("Error in pre-assessment:", error);
+      return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+  }
+}
+
+
+// --- FULL ASSESSMENT HANDLER ---
+async function handleFullAssessment(request, env, headers) {
+    const url = new URL(request.url);
 
     // -------- Optional Bearer auth ----------
     const requireAuth =
@@ -56,10 +167,6 @@ export default {
       return new Response(JSON.stringify({ error: "Unknown admin route" }), { status: 404, headers });
     }
 
-    if (request.method !== "POST") {
-      return new Response("Method Not Allowed", { status: 405, headers });
-    }
-
     const t0 = Date.now();
     const timing = {
       index_ms: 0,
@@ -84,31 +191,29 @@ export default {
       const MAX_RUBRICS_BYTES = num(env.MAX_RUBRICS_BYTES, 1_000_000);
       const MAX_SKILLS_CAP    = num(env.MAX_SKILLS_CAP, 50);
 
-      const ASSESS_RETRY_MAX       = num(env.ASSESS_RETRY_MAX, 1);
-      const ASSESS_RETRY_BASE_MS   = num(env.ASSESS_RETRY_BASE_MS, 700);
+      const ASSESS_RETRY_MAX        = num(env.ASSESS_RETRY_MAX, 1);
+      const ASSESS_RETRY_BASE_MS    = num(env.ASSESS_RETRY_BASE_MS, 700);
 
       const MIN_QUOTES_PER_POSITIVE_PASS  = num(env.MIN_QUOTES_PER_POSITIVE_PASS, 1);
       const MIN_QUOTES_PER_HIGH_LEVEL_PASS = num(env.MIN_QUOTES_PER_HIGH_LEVEL_PASS, 1);
-      const HIGH_LEVEL_START               = num(env.HIGH_LEVEL_START, 4);
-
-      // Fuzzy matching knobs (only used if present; otherwise fallback defaults)
+      const HIGH_LEVEL_START                = num(env.HIGH_LEVEL_START, 4);
+      
       const EVIDENCE_FUZZ      = num(env.EVIDENCE_FUZZ, 0.78);
       const NGRAM_N            = num(env.NGRAM_N, 3);
       const NGRAM_THRESHOLD    = num(env.NGRAM_THRESHOLD, 0.6);
       const SOFT_CONTAINS_MIN  = num(env.SOFT_CONTAINS_MIN, 10);
-    
       
-      const REQUIRE_DISTINCT_EVIDENCE     = bool(env.REQUIRE_DISTINCT_EVIDENCE, false);
-      const MAX_EVIDENCE_REUSE            = num(env.MAX_EVIDENCE_REUSE, 5);
+      const REQUIRE_DISTINCT_EVIDENCE       = bool(env.REQUIRE_DISTINCT_EVIDENCE, false);
+      const MAX_EVIDENCE_REUSE              = num(env.MAX_EVIDENCE_REUSE, 5);
       const ENFORCE_MAX_WORDS_IN_EVIDENCE = bool(env.ENFORCE_MAX_WORDS_IN_EVIDENCE, true);
 
       const MAX_SELLER_QUOTES = num(env.MAX_SELLER_QUOTES, 40);
       const MAX_CUSTOMER_CUES = num(env.MAX_CUSTOMER_CUES, 20);
       const MAX_QUOTE_WORDS   = num(env.MAX_QUOTE_WORDS, 50);
 
-      const INDEX_SEGMENT_CHARS      = num(env.INDEX_SEGMENT_CHARS, 3000);
-      const INDEX_SEGMENT_MAX        = num(env.INDEX_SEGMENT_MAX, 10);
-      const INDEX_SPLIT_MAX_DEPTH    = num(env.INDEX_SPLIT_MAX_DEPTH, 3);
+      const INDEX_SEGMENT_CHARS     = num(env.INDEX_SEGMENT_CHARS, 3000);
+      const INDEX_SEGMENT_MAX       = num(env.INDEX_SEGMENT_MAX, 10);
+      const INDEX_SPLIT_MAX_DEPTH   = num(env.INDEX_SPLIT_MAX_DEPTH, 3);
       
       const WHITELIST_MAX     = num(env.WHITELIST_MAX, 24);
       const BUCKETS_IN_PROMPT = String(env.BUCKETS_IN_PROMPT || "none").toLowerCase();
@@ -119,13 +224,13 @@ export default {
       const INDEX_RETRY_BASE_MS = num(env.INDEX_RETRY_BASE_MS, 800);
 
       const CACHE_VERSION   = String(env.CACHE_VERSION || "1");
-      const KV_TTL_SECS     = num(env.KV_TTL_SECS,    60 * 60 * 24 * 14);
-      const EDGE_TTL_SECS   = num(env.EDGE_TTL_SECS,  60 * 60 * 24 * 7);
+      const KV_TTL_SECS     = num(env.KV_TTL_SECS,   60 * 60 * 24 * 14);
+      const EDGE_TTL_SECS   = num(env.EDGE_TTL_SECS,   60 * 60 * 24 * 7);
       const WARM_EDGE_CACHE = bool(env.WARM_EDGE_CACHE, true);
 
       // ===== Parse body =====
       const body = await request.json();
-      let { transcript, rubrics, rubrics_url, skills, include_presentation, rubric_version } = body || {};
+      let { transcript, rubrics, rubrics_url, skills, include_presentation, rubric_version, sellerId } = body || {};
       if (!transcript && typeof body?.transcript === "string") transcript = body.transcript;
       
       if (!rubrics && rubrics_url) {
@@ -170,7 +275,8 @@ export default {
         return new Response(JSON.stringify({ error: "Missing 'transcript' or 'rubrics' in request body." }), { status: 400, headers });
       }
 
-      // ===== Helpers =====
+      // ===== ALL HELPER FUNCTIONS NOW SCOPED INSIDE handleFullAssessment =====
+      
       const googleURL = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
       function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
       function bool(v, d) { if (v === undefined || v === null) return d; const s = String(v).toLowerCase().trim(); return s === "true" || s === "1" || s === "yes"; }
@@ -311,7 +417,6 @@ export default {
         }
         return sortedRubric;
       }
-
       function sortQuotesDeterministic(arr) {
         const uniq = [...new Set((arr || []).map(normalizeQuote).filter(Boolean))];
         return uniq.sort((a, b) => {
@@ -319,12 +424,10 @@ export default {
           return lc !== 0 ? lc : (a.length - b.length);
         });
       }
-
       function isCustomerEvidenceRequired(characteristicText) {
         const lowerText = String(characteristicText || '').toLowerCase();
         if (!lowerText) return false;
       
-        // Keywords that indicate the seller's performance is a reaction to the customer
         const keywords = [
           'prompting', 'prompted', 
           'guidance', 
@@ -337,71 +440,54 @@ export default {
       
         return keywords.some(keyword => lowerText.includes(keyword));
       }
-
       function isCharacteristicObservable(characteristicText) {
-        // Keywords indicating actions not observable in a transcript.
-        // Using word boundaries (\b) to prevent matching substrings (e.g., 'send' in 'sending').
-          const NON_OBSERVABLE_KEYWORDS = [
-            'document', 'documents', 'documented', 'documentation',
-            'write', 'writes', 'written',
-            'update', 'updates', 'updated',
-            'schedule', 'schedules', 'scheduled',
-            'send', 'sends', 'sent',
-            'log', 'logs', 'logged',
-            'report', 'reports', 'reported',
-            'crm', 'email', 'calendar', 'invite',
-            'follow-up', 'follow up'
+        const NON_OBSERVABLE_KEYWORDS = [
+          'document', 'documents', 'documented', 'documentation',
+          'write', 'writes', 'written',
+          'update', 'updates', 'updated',
+          'schedule', 'schedules', 'scheduled',
+          'send', 'sends', 'sent',
+          'log', 'logs', 'logged',
+          'report', 'reports', 'reported',
+          'crm', 'email', 'calendar', 'invite',
+          'follow-up', 'follow up'
         ];
         const lowerText = String(characteristicText || '').toLowerCase();
-        if (!lowerText) return true; // Default to observable if empty.
-
-        // Return true if the text is observable (i.e., does NOT contain any non-observable keywords).
+        if (!lowerText) return true;
         return !NON_OBSERVABLE_KEYWORDS.some(keyword => {
-            const regex = new RegExp(`\\b${keyword}\\b`);
-            return regex.test(lowerText);
+          const regex = new RegExp(`\\b${keyword}\\b`);
+          return regex.test(lowerText);
         });
       }
-
       function applyObservableFlags(modelChecks, originalRubric) {
         const characteristicMap = new Map();
-        // 1. Build a map of characteristics to their observability status from the original rubric.
         for (const level of originalRubric?.levels || []) {
-            for (const check of level?.checks || []) {
-                const characteristic = String(check.characteristic || '').trim();
-                if (!characteristic) continue;
-
-                // Determine observability with a clear priority:
-                // Priority 1: An explicit `observable` boolean set in the rubric JSON.
-                // Priority 2: Our keyword-based detection for common non-observable actions.
-                // Priority 3: Default to true (observable).
-                let isObservable;
-                if (typeof check.observable === 'boolean') {
-                    isObservable = check.observable;
-                } else {
-                    isObservable = isCharacteristicObservable(characteristic);
-                }
-                characteristicMap.set(characteristic, isObservable);
+          for (const check of level?.checks || []) {
+            const characteristic = String(check.characteristic || '').trim();
+            if (!characteristic) continue;
+            let isObservable;
+            if (typeof check.observable === 'boolean') {
+              isObservable = check.observable;
+            } else {
+              isObservable = isCharacteristicObservable(characteristic);
             }
+            characteristicMap.set(characteristic, isObservable);
+          }
         }
-
-        // 2. Iterate over the model's output and apply the mapped observability flag.
         const processedChecks = JSON.parse(JSON.stringify(modelChecks));
         for (const level of processedChecks || []) {
-            for (const check of level?.checks || []) {
-                const characteristic = String(check.characteristic || '').trim();
-                // Look up the flag from our map. Default to `true` if it was somehow missing from the original rubric.
-                check.observable = characteristicMap.get(characteristic) ?? true;
-            }
+          for (const check of level?.checks || []) {
+            const characteristic = String(check.characteristic || '').trim();
+            check.observable = characteristicMap.get(characteristic) ?? true;
+          }
         }
         return processedChecks;
       }
-
       function orderIndexMap(quotes) {
         const m = new Map();
         (quotes || []).forEach((q, i) => m.set(q, i));
         return m;
       }
-      
       function normalizeChecks(levels) {
         for (const lvl of levels || []) {
           for (const c of (lvl.checks || [])) {
@@ -410,49 +496,42 @@ export default {
         }
         return levels;
       }
-
       function sanitizeEvidenceAgainstIndex(skillLevels, sellerQuotesSet, transcriptText, allowlist) {
         const rawTranscript  = transcriptText || "";
         const normTranscript = normalize(rawTranscript);
-      
+        
         const sellerQuotes = new Set(
           Array.from(sellerQuotesSet || new Set())
             .map(normalize)
             .filter(Boolean)
         );
-      
-        // normalize allowlist (SOFT allow)
+        
         const allowSet = (() => {
           if (!allowlist) return null;
           const arr = allowlist instanceof Set ? Array.from(allowlist)
-                   : Array.isArray(allowlist) ? allowlist : [];
+                      : Array.isArray(allowlist) ? allowlist : [];
           const s = new Set(arr.map(normalize).filter(Boolean));
           return s.size ? s : null;
         })();
-      
+        
         const getMinForLevel = (level) =>
           (Number(level) >= HIGH_LEVEL_START
             ? MIN_QUOTES_PER_HIGH_LEVEL_PASS
             : MIN_QUOTES_PER_POSITIVE_PASS);
-      
+        
         let totalBefore = 0, totalAfter = 0;
-      
-        // --- IMPORTANT: make allowlist soft, not a hard gate
+        
         const hasQuote = (q) => {
           if (!q || typeof q !== "string") return false;
           const n = normalize(q);
           if (!n) return false;
-      
-          // If on allowlist, accept immediately
+        
           if (allowSet && allowSet.has(n)) return true;
-      
-          // 1) exact vs transcript
+        
           if (normTranscript.includes(n)) return true;
-      
-          // 2) exact vs indexed seller quotes
+        
           if (sellerQuotes.has(n)) return true;
-      
-          // 3) fuzzy vs seller quotes
+        
           for (const s of sellerQuotes) {
             if (
               tokenSim(n, s) >= EVIDENCE_FUZZ ||
@@ -460,27 +539,24 @@ export default {
               softContains(n, s, SOFT_CONTAINS_MIN)
             ) return true;
           }
-      
-          // 4) n-gram containment vs transcript for longer quotes
+        
           if (n.length > 40 && ngramContainment(n, normTranscript, NGRAM_N) >= NGRAM_THRESHOLD) return true;
-      
+        
           return false;
         };
-      
+        
         for (const lvl of (skillLevels || [])) {
           const L   = Number(lvl.level) || 0;
           const MIN = getMinForLevel(L);
-      
-          // --- IMPORTANT: throttle evidence reuse **within a level** only
+        
           const reuseCounter = new Map();
-      
+        
           for (const check of (lvl.checks || [])) {
             const ev = Array.isArray(check.evidence) ? check.evidence : [];
             totalBefore += ev.length;
-      
+          
             const kept = ev.map(normalize).filter(hasQuote);
-      
-            // cap reuse across checks (but only within this level)
+          
             const dedupFinal = [];
             for (const q of kept) {
               const used = reuseCounter.get(q) || 0;
@@ -489,15 +565,15 @@ export default {
                 dedupFinal.push(q);
               }
             }
-      
+          
             check.evidence = dedupFinal;
             totalAfter += dedupFinal.length;
-      
+          
             const isPositive = (check.polarity || "positive") === "positive" && (check?.observable ?? true) === true;
             if (isPositive && check.met === true && check.evidence.length < MIN) check.met = false;
           }
         }
-      
+        
         if (REQUIRE_DISTINCT_EVIDENCE) {
           const used = new Set();
           for (const lvl of (skillLevels || [])) {
@@ -512,15 +588,14 @@ export default {
             }
           }
         }
-      
+        
         try {
           const loss = totalBefore ? 1 - (totalAfter / totalBefore) : 1;
           skillLevels._debug = Object.assign({}, skillLevels._debug, { evidenceLossRatioPostSanitize: +loss.toFixed(3) });
         } catch {}
-      
+        
         return correctInconsistentMetStatus(skillLevels);
-      
-        // ------------ helpers ------------
+        
         function normalize(s) {
           return String(s || "")
             .toLowerCase()
@@ -530,15 +605,15 @@ export default {
             .replace(/\s+/g, " ")
             .trim();
         }
-      
+        
         function tokenSim(a, b) {
           const A = new Set(a.split(" ").filter(Boolean));
           const B = new Set(b.split(" ").filter(Boolean));
           const inter = [...A].filter(x => B.has(x)).length;
           const denom = Math.max(A.size, B.size) || 1;
-          return inter / denom; // Jaccard-ish token overlap
+          return inter / denom;
           }
-      
+        
         function softContains(longer, shorter, minLen) {
           if (!longer || !shorter) return false;
           if (shorter.length < (minLen || 10)) return longer.includes(shorter);
@@ -552,7 +627,7 @@ export default {
           }
           return true;
         }
-      
+        
         function ngramContainment(q, corpus, n) {
           const toksQ = q.split(" ").filter(Boolean);
           if (toksQ.length < n) return 0;
@@ -563,7 +638,6 @@ export default {
           return grams.size ? hit / grams.size : 0;
         }
       }      
-      
       function computeStrictRating(levels) {
         if (!Array.isArray(levels) || levels.length === 0) return 1;
         const normalized = normalizeChecks(levels);
@@ -596,7 +670,7 @@ export default {
             c => (c.polarity || "positive") === "positive" && (c?.observable ?? true) === true
           );
           const metDirect = positives.filter(c => c.met && (c.evidence||[]).length >= rq)
-                                     .map(c => c.characteristic);
+                                       .map(c => c.characteristic);
           const attainedViaHigher = (lvl.level <= highest)
             ? positives.filter(c => !(c.met && (c.evidence||[]).length >= rq))
                        .map(c => c.characteristic)
@@ -615,7 +689,6 @@ export default {
         }
         return out;
       }      
-
       function countSkills(r) {
         let n = 0;
         for (const comp in r || {}) {
@@ -641,14 +714,13 @@ export default {
         }
         return out;
       }
-
       function correctInconsistentMetStatus(levels) {
         const corrected = JSON.parse(JSON.stringify(levels));
         for (const level of corrected) {
             if (!level.checks) continue;
             for (const check of level.checks) {
                 const hasEvidence = check.evidence && check.evidence.length > 0;
-                if (check.met === true && !hasEvidence) {
+                if (check.met === true && !hasEvidence && (check?.observable ?? true)) {
                     check.met = false;
                     check.reason = `[AUTO-CORRECTED] 'met' was true but no evidence was found. Original reason: ${check.reason}`;
                 }
@@ -656,7 +728,6 @@ export default {
         }
         return corrected;
       }
-
       function extractFnCall(resp) {
         const cands = resp?.candidates || [];
         for (const c of cands) {
@@ -667,7 +738,6 @@ export default {
         }
         return null;
       }
-
       function normalizePolarity(levels) {
         const NEG_PATTERNS = [/^does not\b/i, /^fails to\b/i, /^provides an incomplete\b/i, /^rarely\b/i];
         const out = JSON.parse(JSON.stringify(levels || []));
@@ -684,7 +754,6 @@ export default {
         }
         return out;
       }
-
       function selectWhitelistForSkill(index, skillName, maxN = WHITELIST_MAX, transcript = "") {
         const all = (index?.seller_quotes || []).map(normalizeQuote).filter(Boolean);
         if (!all.length) return [];
@@ -709,7 +778,6 @@ export default {
         }
         return picked;
       }
-
       function levelRequiredQuotes(lvlNum) {
         return (lvlNum >= HIGH_LEVEL_START)
           ? MIN_QUOTES_PER_HIGH_LEVEL_PASS
@@ -717,27 +785,23 @@ export default {
       }
       
       function didPassLevelPositives(lvl) {
-        if (!lvl || !Array.isArray(lvl.checks)) return true; // Gracefully handle empty levels
+        if (!lvl || !Array.isArray(lvl.checks)) return true;
       
         const rq = levelRequiredQuotes(lvl.level || 0);
       
-        // Condition 1: All observable 'positive' characteristics must be met.
         const positives = lvl.checks.filter(
           c => (c.polarity || "positive") === "positive" && (c?.observable ?? true) === true
         );
         const allPositivesMet = positives.length === 0 || positives.every(c => c.met === true && Array.isArray(c.evidence) && c.evidence.length >= rq);
       
-        // Condition 2: All observable 'limitation' characteristics must also be met.
         const limitations = lvl.checks.filter(
           c => c.polarity === "limitation" && (c?.observable ?? true) === true
         );
         const allLimitationsMet = limitations.every(c => c.met === true);
       
-        // A level is only passed if BOTH conditions are true.
         return allPositivesMet && allLimitationsMet;
       }
       
-      // NEW: highest demonstrated level (attainment)
       function computeHighestDemonstrated(levels) {
         if (!Array.isArray(levels) || levels.length === 0) return 1;
         const normalized = normalizeChecks(levels);
@@ -748,7 +812,6 @@ export default {
         }
         return highest > 0 ? highest : 1;
       }
-
       function selectWhitelistForRubrics(index, rubricsSubset, maxN = WHITELIST_MAX, transcript = "") {
         const allSkills = [];
         for (const comp in rubricsSubset || {}) {
@@ -768,7 +831,7 @@ export default {
           }
         }
         return union.length ? union : (index?.seller_quotes || []).map(normalizeQuote).filter(Boolean).slice(0, maxN);
-      }     
+      }      
       
       function enforceNegativeGuard(levels) {
         const out = JSON.parse(JSON.stringify(levels));
@@ -813,7 +876,17 @@ export default {
       }
       
       function buildDirectedIndexPrompt(transcript, sellerLabel) {
-        const customerLabel = sellerLabel === 'User' ? 'Agent' : 'User';
+        let customerLabel;
+        const lines = transcript.split('\n');
+        const speakers = new Set(lines.map(line => line.split(':')[0].trim()).filter(Boolean));
+        
+        if (speakers.has('Agent') && speakers.has('User')) {
+            customerLabel = sellerLabel === 'User' ? 'Agent' : 'User';
+        } else {
+            speakers.delete(sellerLabel);
+            customerLabel = speakers.values().next().value || 'Customer';
+        }
+
         return `
       You are a STRICT, objective assistant. Your goal is to extract quotes from the provided transcript.
       
@@ -839,7 +912,6 @@ export default {
       function buildAnalysisPrompt(skillName, rubricData, index, whitelist) {
         const sortedRubric = sortRubricDeterministically(rubricData);
       
-        // Identify characteristics that need the customer evidence exception rule
         const customerEvidenceChecks = new Set();
         for (const level of rubricData?.levels || []) {
           for (const check of level?.checks || []) {
@@ -849,7 +921,6 @@ export default {
           }
         }
       
-        // Dynamically create the exception rule text for the prompt
         const exceptionRuleText = customerEvidenceChecks.size > 0 
           ? `**Evidence Rule 2 (Exception):** For characteristics describing the seller requiring "prompting," "guidance," or reacting to "feedback" or "objections," you MUST look for evidence in the \`indexed_customer_cues\`. For this skill, this rule applies to: ${stable(Array.from(customerEvidenceChecks))}`
           : `**Evidence Rule 2 (No Exceptions):** For this skill, all evidence must come from the seller's quotes. The \`indexed_customer_cues\` are for context only.`;
@@ -976,11 +1047,13 @@ export default {
       };
 
       // ===== Gemini calls =====
-      async function callGeminiIndex(apiKey, transcriptPart) {
-        const hasAgentUserLabels = transcriptPart.includes("Agent:") && transcriptPart.includes("User:");
+      async function callGeminiIndex(apiKey, transcriptPart, sellerId = null) {
         let prompt;
-    
-        if (hasAgentUserLabels) {
+        const hasAgentUserLabels = transcriptPart.includes("Agent:") && transcriptPart.includes("User:");
+      
+        if (sellerId) {
+          prompt = buildDirectedIndexPrompt(transcriptPart, sellerId);
+        } else if (hasAgentUserLabels) {
           prompt = buildDirectedIndexPrompt(transcriptPart, 'User');
         } else {
           prompt = buildIndexPrompt(transcriptPart);
@@ -1008,152 +1081,143 @@ export default {
       }
 
       // ===== NEW TWO-STEP ASSESSMENT LOGIC =====
-async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, index, wl) {
-  const allowedQuotes = Array.isArray(wl) && wl.length
-    ? wl.map(normalizeQuote).filter(Boolean)
-    : (index?.seller_quotes || []).map(normalizeQuote).filter(Boolean);
+    async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, index, wl) {
+      const allowedQuotes = Array.isArray(wl) && wl.length
+        ? wl.map(normalizeQuote).filter(Boolean)
+        : (index?.seller_quotes || []).map(normalizeQuote).filter(Boolean);
 
-  const tA0 = Date.now();
-  let promptBytes = 0;
+      const tA0 = Date.now();
+      let promptBytes = 0;
 
-  const analysisPrompt = buildAnalysisPrompt(skillName, rubricData, index, allowedQuotes);
-  promptBytes += bytes(analysisPrompt);
+      const analysisPrompt = buildAnalysisPrompt(skillName, rubricData, index, allowedQuotes);
+      promptBytes += bytes(analysisPrompt);
 
-  const analysisResult = await withRetry(() => fetchJSON(googleURL(ASSESS_MODEL), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: analysisPrompt }] }],
-      tools: [analysisTool],
-      toolConfig: { functionCallingConfig: { mode: "ANY" } },
-      generationConfig: {
-        temperature: 0,
-        topK: 1,
-        topP: 0,
-        candidateCount: 1
-      },  
-      safetySettings: [
-        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-      ],
-    }),
-  }), { retries: ASSESS_RETRY_MAX, baseMs: ASSESS_RETRY_BASE_MS });
+      const analysisResult = await withRetry(() => fetchJSON(googleURL(ASSESS_MODEL), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: analysisPrompt }] }],
+          tools: [analysisTool],
+          toolConfig: { functionCallingConfig: { mode: "ANY" } },
+          generationConfig: {
+            temperature: 0,
+            topK: 1,
+            topP: 0,
+            candidateCount: 1
+          },  
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+          ],
+        }),
+      }), { retries: ASSESS_RETRY_MAX, baseMs: ASSESS_RETRY_BASE_MS });
 
-  const analysisCall = analysisResult?.candidates?.[0]?.content?.parts?.[0]?.functionCall;
-  if (!analysisCall?.args?.level_checks) {
-    throw new Error(`Analysis step failed for skill "${skillName}". Reason: ${analysisResult?.candidates?.[0]?.finishReason || "No function call."}`);
-  }
+      const analysisCall = analysisResult?.candidates?.[0]?.content?.parts?.[0]?.functionCall;
+      if (!analysisCall?.args?.level_checks) {
+        throw new Error(`Analysis step failed for skill "${skillName}". Reason: ${analysisResult?.candidates?.[0]?.finishReason || "No function call."}`);
+      }
 
-  const rawLevelChecks = JSON.parse(JSON.stringify(analysisCall.args.level_checks));
+      const rawLevelChecks = JSON.parse(JSON.stringify(analysisCall.args.level_checks));
 
-  // --- NEW: Apply observability flags before any processing or rating calculation ---
-  const checksWithObservableFlags = applyObservableFlags(analysisCall.args.level_checks, rubricData);
+      const checksWithObservableFlags = applyObservableFlags(analysisCall.args.level_checks, rubricData);
 
-  // --- normalize once, keep both RAW and SANITIZED branches
-  const rawNormalized = normalizePolarity(checksWithObservableFlags); // Use the processed checks
-  const sellerQuotesSet = new Set((index?.seller_quotes || []).map(normalizeQuote));
-  
-  // Strict sanitization (enforce allowlist)
-  let levelChecks = sanitizeEvidenceAgainstIndex(
-    JSON.parse(JSON.stringify(rawNormalized)),
-    sellerQuotesSet,
-    transcript,
-    new Set(allowedQuotes)
-  );
-  levelChecks = enforceNegativeGuard(levelChecks);
+      const rawNormalized = normalizePolarity(checksWithObservableFlags); 
+      const sellerQuotesSet = new Set((index?.seller_quotes || []).map(normalizeQuote));
+      
+      let levelChecks = sanitizeEvidenceAgainstIndex(
+        JSON.parse(JSON.stringify(rawNormalized)),
+        sellerQuotesSet,
+        transcript,
+        new Set(allowedQuotes)
+      );
+      levelChecks = enforceNegativeGuard(levelChecks);
 
-  // --- Consistency guard: compare pre/post-sanitization
-  const ratingRaw = computeHighestDemonstrated(rawNormalized);
-  const ratingSanitized = computeHighestDemonstrated(levelChecks);
+      const ratingRaw = computeHighestDemonstrated(rawNormalized);
+      const ratingSanitized = computeHighestDemonstrated(levelChecks);
 
-  const countMet = (checks) =>
-    checks.flatMap(l => l.checks || []).filter(c => c?.polarity !== "limitation" && c?.met === true).length;
+      const countMet = (checks) =>
+        checks.flatMap(l => l.checks || []).filter(c => c?.polarity !== "limitation" && c?.met === true).length;
 
-  const metRaw = countMet(rawNormalized);
-  const metAfter = countMet(levelChecks);
+      const metRaw = countMet(rawNormalized);
+      const metAfter = countMet(levelChecks);
 
-  const evidenceLossRatio = metRaw > 0 ? (metRaw - metAfter) / metRaw : 1;
+      const evidenceLossRatio = metRaw > 0 ? (metRaw - metAfter) / metRaw : 1;
 
-  // If sanitization wiped most positives and cratered the score,
-  // apply a soft floor so we don't report absurd 1/5s on clearly decent calls.
-  // Tunables:
-  const LOSS_THRESHOLD = 0.6; // >60% positives disappeared
-  const RAW_MIN_FOR_FLOOR = 3; // model thought at least "Progressing"
-  const MAX_SOFT_FLOOR = 3;    // don't overcorrect past 3/5
+      const LOSS_THRESHOLD = 0.6;
+      const RAW_MIN_FOR_FLOOR = 3;
+      const MAX_SOFT_FLOOR = 3;   
 
-  let rating = ratingSanitized;
-  if (ratingSanitized <= 1 && ratingRaw >= RAW_MIN_FOR_FLOOR && evidenceLossRatio >= LOSS_THRESHOLD) {
-    rating = Math.min(MAX_SOFT_FLOOR, Math.max(2, ratingRaw - 1));
-  }
+      let rating = ratingSanitized;
+      if (ratingSanitized <= 1 && ratingRaw >= RAW_MIN_FOR_FLOOR && evidenceLossRatio >= LOSS_THRESHOLD) {
+        rating = Math.min(MAX_SOFT_FLOOR, Math.max(2, ratingRaw - 1));
+      }
 
-  const gating_summary = buildGatingSummary(levelChecks);
+      const gating_summary = buildGatingSummary(levelChecks);
 
-  const coachingPrompt = buildCoachingPrompt(skillName, rating, levelChecks, gating_summary);
-  promptBytes += bytes(coachingPrompt);
+      const coachingPrompt = buildCoachingPrompt(skillName, rating, levelChecks, gating_summary);
+      promptBytes += bytes(coachingPrompt);
 
-  const coachingResult = await withRetry(() => fetchJSON(googleURL(ASSESS_MODEL), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: coachingPrompt }] }],
-      tools: [coachingTool],
-      toolConfig: { functionCallingConfig: { mode: "ANY" } },
-      generationConfig: {
-        temperature: 0,
-        topK: 1,
-        topP: 0,
-        candidateCount: 1
-      },      
-      safetySettings: [
-        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-      ],
-    }),
-  }), { retries: ASSESS_RETRY_MAX, baseMs: ASSESS_RETRY_BASE_MS });
+      const coachingResult = await withRetry(() => fetchJSON(googleURL(ASSESS_MODEL), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: coachingPrompt }] }],
+          tools: [coachingTool],
+          toolConfig: { functionCallingConfig: { mode: "ANY" } },
+          generationConfig: {
+            temperature: 0,
+            topK: 1,
+            topP: 0,
+            candidateCount: 1
+          },        
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+          ],
+        }),
+      }), { retries: ASSESS_RETRY_MAX, baseMs: ASSESS_RETRY_BASE_MS });
 
-  const ms = Date.now() - tA0;
-  timing.assess_calls.push({ mode: "single_decoupled", skills: 1, ms, prompt_bytes: promptBytes, skill: skillName });
-  timing.assess_ms_total += ms;
-  timing.prompt_bytes_total += promptBytes;
+      const ms = Date.now() - tA0;
+      timing.assess_calls.push({ mode: "single_decoupled", skills: 1, ms, prompt_bytes: promptBytes, skill: skillName });
+      timing.assess_ms_total += ms;
+      timing.prompt_bytes_total += promptBytes;
 
-  const coachingCall = coachingResult?.candidates?.[0]?.content?.parts?.[0]?.functionCall;
-  if (!coachingCall?.args) {
-    console.error(`Coaching step failed for skill "${skillName}". Reason: ${coachingResult?.candidates?.[0]?.finishReason || "No function call."}`);
-    return {
-      skill: skillName,
-      rating,
-      level_checks: levelChecks,
-      gating_summary,
-      strengths: [],
-      improvements: [],
-      coaching_tips: [],
-      seller_identity: index?.seller_label || "Seller",
-      // Helpful debug for your logs:
-      _debug: { ratingRaw, ratingSanitized, metRaw, metAfter, evidenceLossRatio },
-      _raw_model_output: rawLevelChecks,
-    };
-  }
+      const coachingCall = coachingResult?.candidates?.[0]?.content?.parts?.[0]?.functionCall;
+      if (!coachingCall?.args) {
+        console.error(`Coaching step failed for skill "${skillName}". Reason: ${coachingResult?.candidates?.[0]?.finishReason || "No function call."}`);
+        return {
+          skill: skillName,
+          rating,
+          level_checks: levelChecks,
+          gating_summary,
+          strengths: [],
+          improvements: [],
+          coaching_tips: [],
+          seller_identity: index?.seller_label || "Seller",
+          _debug: { ratingRaw, ratingSanitized, metRaw, metAfter, evidenceLossRatio },
+          _raw_model_output: rawLevelChecks,
+        };
+      }
 
-  const { strengths, improvements, coaching_tips } = coachingCall.args;
+      const { strengths, improvements, coaching_tips } = coachingCall.args;
 
-  return {
-    skill: skillName,
-    rating,
-    strengths: strengths || [],
-    improvements: improvements || [],
-    coaching_tips: coaching_tips || [],
-    seller_identity: index?.seller_label || "Seller",
-    level_checks: levelChecks,
-    gating_summary,
-    // Helpful debug for your logs:
-    _debug: { ratingRaw, ratingSanitized, metRaw, metAfter, evidenceLossRatio },
-    _raw_model_output: rawLevelChecks,
-  };
-}
+      return {
+        skill: skillName,
+        rating,
+        strengths: strengths || [],
+        improvements: improvements || [],
+        coaching_tips: coaching_tips || [],
+        seller_identity: index?.seller_label || "Seller",
+        level_checks: levelChecks,
+        gating_summary,
+        _debug: { ratingRaw, ratingSanitized, metRaw, metAfter, evidenceLossRatio },
+        _raw_model_output: rawLevelChecks,
+      };
+    }
 
 
 
@@ -1239,7 +1303,7 @@ async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, 
                   
                   const subTurns = splitLongTurn(turn.speaker, turn.text, target - (turn.speaker.length + 5));
                   for (const subTurn of subTurns) {
-                       chunks.push(`${subTurn.speaker}: ${subTurn.text}`);
+                          chunks.push(`${subTurn.speaker}: ${subTurn.text}`);
                   }
                   continue;
               }
@@ -1261,12 +1325,12 @@ async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, 
       function mergeIndexes(list, maxSeller, maxCues) {
         const hasUser = list.some(idx => idx?.seller_label === 'User');
         const sellerLabel = hasUser ? 'User' : (list.find(idx => idx?.seller_label)?.seller_label || 'Seller');
-    
+      
         const allSellerQuotes = new Set();
         const allCustomerCues = new Set();
         const allBucketedEvidence = {};
         BUCKET_ORDER.forEach(k => allBucketedEvidence[k] = new Set());
-    
+      
         for (const idx of list) {
           if (!idx || !idx.seller_label) continue;
           
@@ -1305,41 +1369,41 @@ async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, 
         return out;
       }
 
-      async function adaptiveIndexSingle(apiKey, part, depth = 0) {
-          try {
-              return await callGeminiIndex(apiKey, part);
-          } catch (e) {
-              const msg = String(e?.message || e);
-              const transient = /timeout|timed out|429|5\d\d|unavailable|quota|exhausted/i.test(msg);
-              if (!transient || depth >= INDEX_SPLIT_MAX_DEPTH) throw e;
-              
-              if (depth < INDEX_SPLIT_MAX_DEPTH) {
-                  const mid = Math.floor(part.length / 2);
-                  const a = part.slice(0, mid).trim();
-                  const b = part.slice(mid).trim();
-                  if (a && b) {
-                      const [idxA, idxB] = await Promise.all([
-                          adaptiveIndexSingle(apiKey, a, depth + 1),
-                          adaptiveIndexSingle(apiKey, b, depth + 1),
-                      ]);
-                      return mergeIndexes([idxA, idxB], MAX_SELLER_QUOTES, MAX_CUSTOMER_CUES);
-                  }
-              }
-              throw e;
+      async function adaptiveIndexSingle(apiKey, part, sellerId, depth = 0) {
+        try {
+          return await callGeminiIndex(apiKey, part, sellerId);
+        } catch (e) {
+          const msg = String(e?.message || e);
+          const transient = /timeout|timed out|429|5\d\d|unavailable|quota|exhausted/i.test(msg);
+          if (!transient || depth >= INDEX_SPLIT_MAX_DEPTH) throw e;
+          
+          if (depth < INDEX_SPLIT_MAX_DEPTH) {
+            const mid = Math.floor(part.length / 2);
+            const a = part.slice(0, mid).trim();
+            const b = part.slice(mid).trim();
+            if (a && b) {
+              const [idxA, idxB] = await Promise.all([
+                adaptiveIndexSingle(apiKey, a, sellerId, depth + 1),
+                adaptiveIndexSingle(apiKey, b, sellerId, depth + 1),
+              ]);
+              return mergeIndexes([idxA, idxB], MAX_SELLER_QUOTES, MAX_CUSTOMER_CUES);
+            }
           }
+          throw e;
+        }
       }
 
-      async function indexTranscriptSmart(apiKey, transcriptFull) {
+      async function indexTranscriptSmart(apiKey, transcriptFull, sellerId = null) {
         const t = normalizeTranscript(transcriptFull);
         const parts = splitOnSpeakerBoundaries(t, INDEX_SEGMENT_CHARS, INDEX_SEGMENT_MAX);
         timing.index_segments = parts.length;
         const tS = Date.now();
         if (parts.length === 1) {
-          const res = await adaptiveIndexSingle(apiKey, parts[0], 0);
+          const res = await adaptiveIndexSingle(apiKey, parts[0], sellerId, 0);
           timing.index_ms = Date.now() - tS;
           return res;
         }
-        const tasks = parts.map((p) => () => adaptiveIndexSingle(apiKey, p, 0));
+        const tasks = parts.map((p) => () => adaptiveIndexSingle(apiKey, p, sellerId, 0));
         const results = await runWithPool(tasks, Math.min(MAX_CONCURRENCY, 3));
         const valid = results.filter(Boolean);
         timing.index_ms = Date.now() - tS;
@@ -1355,7 +1419,9 @@ async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, 
       if (Array.isArray(skills) && skills.length && suppliedSkillCount > skills.length) {
         rubrics = pickSelectedRubrics(rubrics, skills);
       }
+      
       transcript = normalizeTranscript(transcript);
+
       const indexKeyInput = stable({
         v: CACHE_VERSION,
         INDEX_MODEL,
@@ -1366,6 +1432,7 @@ async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, 
         INDEX_SEGMENT_MAX,
         INDEX_SPLIT_MAX_DEPTH,
         transcript,
+        sellerId
       });
       const indexKeyHash = await sha256Hex(indexKeyInput);
       const indexKVKey  = `v${CACHE_VERSION}:index:${indexKeyHash}`;
@@ -1376,7 +1443,7 @@ async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, 
         if (rawIndex) index_kv_hit = true;
       }
       if (!rawIndex) {
-        rawIndex = await indexTranscriptSmart(GEMINI_API_KEY, transcript);
+        rawIndex = await indexTranscriptSmart(GEMINI_API_KEY, transcript, sellerId);
         if (env.ASSESS_CACHE) await kvPutJSON(env.ASSESS_CACHE, indexKVKey, rawIndex, KV_TTL_SECS);
         await edgePutJSON(edgeKey("index", indexKeyHash), rawIndex);
       }
@@ -1523,5 +1590,4 @@ async function getAssessmentForSkill(apiKey, transcript, skillName, rubricData, 
       const status = /Timeout/i.test(msg) || /(^|[^0-9])524([^0-9]|$)/.test(msg) ? 504 : 500;
       return new Response(JSON.stringify({ error: msg }), { status, headers });
     }
-  },
-};
+}
