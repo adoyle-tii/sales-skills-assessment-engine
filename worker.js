@@ -1564,7 +1564,8 @@ ${stable(sortedRubric)}
       INDEX_SEGMENT_MAX,
       INDEX_SPLIT_MAX_DEPTH,
       transcript,
-      sellerId
+      sellerId,
+      skill: presentSkills && presentSkills.length === 1 ? presentSkills[0] : presentSkills
     });
     const indexKeyHash = await sha256Hex(indexKeyInput);
     const indexKVKey  = `v${CACHE_VERSION}:index:${indexKeyHash}`;
@@ -1883,7 +1884,12 @@ parsedJudge = { level_checks: lc };
       const LOSS_THRESHOLD = 0.6;
       const RAW_MIN_FOR_FLOOR = 3;
       const MAX_SOFT_FLOOR = 3;
+      // Cap rating at rubric's max valid level (exclude 'Not applicable')
       let rating = ratingSanitized;
+      // Find max valid rubric level (exclude 'Not applicable' and empty checks)
+      const validLevels = (rubricData?.levels || []).filter(l => l.name && l.name.toLowerCase() !== 'not applicable' && l.checks && l.checks.length > 0);
+      const maxRubricLevel = validLevels.length ? Math.max(...validLevels.map(l => l.level || 0)) : 5;
+      if (rating > maxRubricLevel) rating = maxRubricLevel;
       if (ratingSanitized <= 1 && ratingRaw >= RAW_MIN_FOR_FLOOR && evidenceLossRatio >= LOSS_THRESHOLD) {
         rating = Math.min(MAX_SOFT_FLOOR, Math.max(2, ratingRaw - 1));
       }
