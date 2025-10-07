@@ -1260,21 +1260,20 @@ ${stable(sortedRubric)}
     let quoteIndex = 0;
 
     // 3. Map over the improvements and fill in the blank 'instead_of' fields sequentially.
-    return (improvements || []).map(impr => {
-        // If the structure is valid and the 'instead_of' field is currently empty...
-        if (impr && impr.example && !impr.example.instead_of) {
-            // ...pick the next available quote from our sorted list.
-            if (quoteIndex < availableQuotes.length) {
-                // This prevents using the same quote for every single improvement.
-                impr.example.instead_of = availableQuotes[quoteIndex];
-                quoteIndex++;
-            } else if (availableQuotes.length > 0) {
-                // As a fallback if we run out of unique quotes, just repeat the last best one.
-                impr.example.instead_of = availableQuotes[availableQuotes.length - 1];
-            }
-        }
-        return impr;
-    });
+  return (improvements || []).map(impr => {
+    if (impr && impr.example && !impr.example.instead_of) {
+      if (quoteIndex < availableQuotes.length) {
+        impr.example.instead_of = availableQuotes[quoteIndex];
+        quoteIndex++;
+      } else if (availableQuotes.length > 0) {
+        impr.example.instead_of = availableQuotes[availableQuotes.length - 1];
+      } else {
+        // No available quote, so remove the property
+        delete impr.example.instead_of;
+      }
+    }
+    return impr;
+  });
   }
 
 
