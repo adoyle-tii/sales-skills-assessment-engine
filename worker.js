@@ -141,8 +141,9 @@ MANDATORY RULES:
 - **CONTEXT IS PARAMOUNT:** Your assessment must be based on the overall conversational flow. Do not penalize rhetorical questions.
 
 - **LIMITATION LOGIC:** For any check with 'polarity: "limitation"', you MUST follow this two-step process:
-    1. First, ask internally: 'Was the seller's performance WORSE than the described limitation?'
-    2. If the answer is YES, you MUST set 'met: false'. If the answer is NO (meaning performance was the same as OR better), you MUST set 'met: true'. Your 'reason' must explicitly state which of these conditions was met.
+  1. First, ask internally: 'Was the seller's performance WORSE than the described limitation?'
+  2. If the answer is YES, you MUST set 'met: false'. If the answer is NO (meaning performance was the same as OR better), you MUST set 'met: true'.
+  3. **IMPORTANT:** If the seller's performance is EXACTLY EQUAL to the described limitation (not worse, not better), you MUST set 'met: true'. Do NOT penalize for being exactly at the limitation threshold. Your 'reason' must explicitly state which of these conditions was met.
 
 - **DO NOT HALLUCINATE:** You are strictly forbidden from inventing evidence or using any text from this system prompt in your 'evidence' field. All evidence must originate from the user's transcript.
 `;
