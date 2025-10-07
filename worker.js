@@ -1245,9 +1245,17 @@ ${stable(sortedRubric)}
   function backfillImprovementQuotes(improvements, levelChecks) {
     // 1. Find all available "gap" quotes from positive skills the seller actually MET.
     //    These are the best examples of what the seller did "instead of" the mastery-level skill.
-    const metPositiveChecks = flattenAllEvidence(levelChecks)
+    let metPositiveChecks = flattenAllEvidence(levelChecks)
         .filter(e => e.polarity === 'positive' && e.met === true && e.quote)
         .sort((a, b) => b.level - a.level); // Sort descending to prioritize higher-level skills.
+
+    // If there are no met positives (e.g., rating is 1), use any quotes from level 1 (any polarity, any met status)
+    if (metPositiveChecks.length === 0) {
+        const level1Quotes = flattenAllEvidence(levelChecks)
+            .filter(e => e.level === 1 && e.quote)
+            .map(e => e.quote);
+        metPositiveChecks = level1Quotes.map(q => ({ quote: q }));
+    }
 
     // 2. Extract just the unique quotes into a list to prevent duplicates.
     const availableQuotes = [...new Set(metPositiveChecks.map(e => e.quote))];
@@ -1257,7 +1265,6 @@ ${stable(sortedRubric)}
     return (improvements || []).map(impr => {
         // If the structure is valid and the 'instead_of' field is currently empty...
         if (impr && impr.example && !impr.example.instead_of) {
-            
             // ...pick the next available quote from our sorted list.
             if (quoteIndex < availableQuotes.length) {
                 // This prevents using the same quote for every single improvement.
@@ -1455,6 +1462,7 @@ ${stable(sortedRubric)}
       const results = [];
       let i = 0;
       const workers = new Array(Math.min(limit, tasks.length)).fill(0).map(async () => {
+
         while (i < tasks.length) {
           const idx = i++;
           try { results[idx] = await tasks[idx](); }
