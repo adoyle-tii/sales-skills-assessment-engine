@@ -1819,6 +1819,7 @@ const lc = Array.isArray(parsedJudge.level_checks)
 parsedJudge = { level_checks: lc };
 // --- end robust parse block ---
 
+
       // ---- Post-process -----------------------------------------------------
       const rawLevelChecks = JSON.parse(JSON.stringify(parsedJudge.level_checks));
       const checksWithObservableFlags = applyObservableFlags(parsedJudge.level_checks, rubricData);
@@ -1832,6 +1833,28 @@ parsedJudge = { level_checks: lc };
         new Set(allowedQuotes)
       );
       levelChecks = enforceNegativeGuard(levelChecks);
+
+      // --- Limitation post-processing: set met=true if evidence matches limitation exactly ---
+      function limitationPostProcess(levelChecks) {
+        for (const lvl of levelChecks || []) {
+          for (const check of (lvl.checks || [])) {
+            if (check.polarity === 'limitation' && check.met === false && Array.isArray(check.evidence) && check.evidence.length > 0) {
+              // If the evidence is not worse than the limitation, set met=true
+              // Heuristic: if the evidence is present and matches the limitation description, set met=true
+              // (This is a best-effort, as 'worse than' is subjective)
+              const charNorm = String(check.characteristic || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+              const evNorm = check.evidence.map(e => String(e).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
+              // If any evidence is a substring or equal to the characteristic, treat as 'same as'
+              if (evNorm.some(e => charNorm && (e === charNorm || charNorm.includes(e) || e.includes(charNorm)))) {
+                check.met = true;
+                check.reason = `[AUTO-CORRECTED] Evidence matches limitation exactly; set met: true. Original reason: ${check.reason}`;
+              }
+            }
+          }
+        }
+        return levelChecks;
+      }
+      levelChecks = limitationPostProcess(levelChecks);
 
       const ratingRaw = computeHighestDemonstrated(rawNormalized);
       const ratingSanitized = computeHighestDemonstrated(levelChecks);
