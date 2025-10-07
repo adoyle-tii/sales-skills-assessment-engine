@@ -1143,15 +1143,21 @@ ${stable(sortedRubric)}
 }
 
     function buildCoachingPrompt(skillName, rating, levelChecks, gatingSummary) {
-      return `
-      You are an expert AI Sales Coach. The analysis for "${skillName}" has a final rating of ${rating}/5.
-      Use ONLY this analysis (do not re-score):
-      ${stable({ level_checks: levelChecks, gating_summary: gatingSummary })}
-      YOUR TASK:
-      - Return ONLY JSON via extract_coaching_feedback.
-      - 2-4 strengths (from highest achieved).
-      - 3-5 improvements (unmet positives at the next level), include a concise supporting quote when available.
-      - 3-6 actionable coaching tips mapped to the improvements.`;
+  return `
+  You are an expert AI Sales Coach. The analysis for "${skillName}" has a final rating of ${rating}/5.
+  Use ONLY this analysis (do not re-score):
+  ${stable({ level_checks: levelChecks, gating_summary: gatingSummary })}
+      
+  YOUR TASK:
+  - Return ONLY JSON via extract_coaching_feedback.
+  - 2-4 strengths (from highest achieved).
+  - 3-5 improvements (unmet positives at the next level), include a concise supporting quote when available.
+  - 3-6 actionable coaching tips mapped to the improvements.
+      
+  IMPORTANT:
+  - For each improvement, only provide a 'Try this' suggestion if there is a relevant seller quote or evidence in the analysis.
+  - If there is no relevant seller quote or evidence for an improvement, OMIT the 'Try this' suggestion for that point (do not invent or hallucinate).
+  - 'Try this' suggestions must be directly inspired by the seller's actual statements in the transcript. If no such statement exists, omit the suggestion.`;
     }
 
     // ===== Tool schemas (Gemini indexing only) -------
