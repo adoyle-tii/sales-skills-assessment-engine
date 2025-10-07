@@ -62,6 +62,26 @@ async function sha256Hex(s) {
   const hash = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+// --- Simple skill key: normalized transcript + sellerId + skillName ---
+function __normalizeTranscriptSimple(s) {
+  if (!s) return "";
+  let t = String(s);
+  t = t.replace(/\t/g, " ")
+       .replace(/[ \u00A0]{2,}/g, " ")
+       .replace(/\n{3,}/g, "\n\n")
+       .trim();
+  return t;
+}
+async function simpleSkillKeyHash({ cacheVersion, transcript, sellerId, skillName }) {
+  const input = {
+    v: String(cacheVersion || "1"),
+    sellerId: String(sellerId || ""),
+    skillName: String(skillName || ""),
+    transcript: __normalizeTranscriptSimple(transcript || "")
+  };
+  return await sha256Hex(stable(input));
+}
+
 async function kvGetJSON(ns, key) {
   if (!ns) return null;
   const s = await ns.get(key);
@@ -144,6 +164,7 @@ MANDATORY RULES:
   1. First, ask internally: 'Was the seller's performance WORSE than the described limitation?'
   2. If the answer is YES, you MUST set 'met: false'. If the answer is NO (meaning performance was the same as OR better), you MUST set 'met: true'.
   3. **IMPORTANT:** If the seller's performance is EXACTLY EQUAL to the described limitation (not worse, not better), you MUST set 'met: true'. Do NOT penalize for being exactly at the limitation threshold. Your 'reason' must explicitly state which of these conditions was met.
+  4. **EXCEPTION FOR ABSENCE:** If a Level 1 limitation describes a complete lack of a skill (e.g., "Demonstrates little to no understanding"), and you find no evidence of that skill in the entire transcript, you MUST set 'met: true' and your reason should state "The skill was not demonstrated at any point in the conversation."
 
 - **DO NOT HALLUCINATE:** You are strictly forbidden from inventing evidence or using any text from this system prompt in your 'evidence' field. All evidence must originate from the user's transcript.
 `;
@@ -166,15 +187,15 @@ You are a practical, expert sales coach. Your task is to provide concise, action
 
 **CRITICAL RULES FOR YOUR TASK:**
 
-1.  **Generate 'strengths':** Write 2-4 strengths from the highest-rated "met: true" positive characteristics.
+1.  **Generate 'strengths':** Write 2-4 strengths from the highest-rated "met: true" positive characteristics. If none are met, this MUST be an empty array.
 
-2.  **Generate 'improvements':** This is the most important step. You MUST generate 3-5 items in this array. Every item in the 'improvements' array MUST be an object with two keys: "point" and "example".
-    - For the "point", describe the high-level skill to improve based on an unmet 'positive' characteristic.
-    - For the "example", you must generate a nested object with two keys: "instead_of" and "try_this".
-        - **'instead_of'**: Find a real, verbatim quote from the seller that demonstrates the gap or missed opportunity. If no quote is a good fit, use an empty string.
-        - **'try_this'**: Write a short, practical, and superior alternative phrase the seller could have used in that situation.
+2.  **Generate 'improvements':** This is your most important task. Generate 3-5 improvements.
+    - Base your improvements on the **unmet 'positive' characteristics** from the rubric, starting with the lowest levels first. These are the foundational skills.
+    - For the 'example' object:
+        - **'instead_of'**: Use the verbatim quote provided in the analysis. **If the quote seems generic or irrelevant**, explain the conversational context where the skill was missed. For example: "When the customer expressed concern about the product's fit, the seller changed the subject."
+        - **'try_this'**: Write a short, practical, and superior alternative the seller could have used in that specific situation.
 
-3.  **Generate 'coaching_tips':** Write 3-6 actionable tips that directly relate to the 'improvements'.
+3.  **Generate 'coaching_tips':** Write 3-6 actionable tips directly related to the 'improvements'. Your tips must be grounded in the conversational context.
 `;
 
 // --- SHARED WHITELIST HELPERS ---
@@ -298,17 +319,17 @@ export default {
       handler = handleFullAssessment;
     }
 
-    const response = await handler(request, env);
+    let response = await handler(request, env);
 
+    if (!(response instanceof Response)) {
+      response = new Response(typeof response === "string" ? response : JSON.stringify(response), {
+        headers: { "Content-Type": "application/json; charset=utf-8" }
+      });
+    }
     const newHeaders = new Headers(response.headers);
     newHeaders.set("Access-Control-Allow-Origin", allowOrigin);
     newHeaders.set("Vary", "Origin");
-    
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: newHeaders,
-    });
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: newHeaders });
   },
 };
 
@@ -412,25 +433,18 @@ async function handlePreAssessment(request, env) {
 }
 
 // --- CACHE CHECK HANDLER ---
+
 async function handleCacheCheck(request, env) {
   const headers = { "Content-Type": "application/json; charset=utf-8" };
   try {
     const body = await request.json().catch(() => ({}));
-    const { transcript, sellerId, skills, rubrics } = body;
-
-    const CACHE_VERSION = String(env.CACHE_VERSION || "1");
-    const INDEX_MODEL   = (env.INDEX_MODEL   || "gemini-2.5-pro").trim();
-    const ASSESS_MODEL  = (env.ASSESS_MODEL  || "gemini-2.5-pro").trim();
-
-    const WHITELIST_MAX = num(env.WHITELIST_MAX, 24);
-    const MAX_QUOTE_WORDS = num(env.MAX_QUOTE_WORDS, 50);
-    const ENFORCE_MAX_WORDS_IN_EVIDENCE = bool(env.ENFORCE_MAX_WORDS_IN_EVIDENCE, true);
-
-    if (!transcript || !sellerId || !Array.isArray(skills) || !rubrics) {
+    const { transcript, sellerId, skills } = body;
+    if (!transcript || !sellerId || !Array.isArray(skills) || skills.length === 0) {
       return new Response(JSON.stringify({ error: "Missing required fields for cache check." }), { status: 400, headers });
     }
 
-    const normalizeTranscript = (s) => {
+    // (Optional) Use the same normalization as writer for gating/whitelist only
+    const normTranscript = (function normalizeTranscript(s) {
       if (!s) return "";
       let t = String(s);
       t = t.replace(/\t/g, " ")
@@ -438,94 +452,25 @@ async function handleCacheCheck(request, env) {
            .replace(/\n{3,}/g, "\n\n")
            .trim();
       return t;
-    };
+    })(transcript);
 
-    const normTranscript = normalizeTranscript(transcript);
-
-    const indexKeyInput = stable({
-      v: CACHE_VERSION,
-      INDEX_MODEL,
-      MAX_SELLER_QUOTES: num(env.MAX_SELLER_QUOTES, 40),
-      MAX_CUSTOMER_CUES: num(env.MAX_CUSTOMER_CUES, 20),
-      MAX_QUOTE_WORDS:   MAX_QUOTE_WORDS,
-      INDEX_SEGMENT_CHARS:   num(env.INDEX_SEGMENT_CHARS, 3000),
-      INDEX_SEGMENT_MAX:     num(env.INDEX_SEGMENT_MAX, 10),
-      INDEX_SPLIT_MAX_DEPTH: num(env.INDEX_SPLIT_MAX_DEPTH, 3),
-      transcript: normTranscript,
-      sellerId
-    });
-    const indexKeyHash = await sha256Hex(indexKeyInput);
-    const indexKVKey   = `v${CACHE_VERSION}:index:${indexKeyHash}`;
-
-    const cachedIndex = env.ASSESS_CACHE ? await kvGetJSON(env.ASSESS_CACHE, indexKVKey) : null;
-
-    const findRubricForSkill = (allRubrics, skillName) => {
-      for (const competency in allRubrics) {
-        if (allRubrics[competency]?.skills?.[skillName]) {
-          return allRubrics[competency].skills[skillName];
-        }
-      }
-      return null;
-    };
-
-    async function buildAssessSkillKeyHash({ cacheVersion, assessModel, minQuotesPerPositivePass, requireDistinctEvidence, maxEvidenceReuse, enforceMaxWords, bucketsInPrompt, bucketSampleN, skillName, rubricData, whitelist, indexKeyHash }) {
-      const input = {
-        v: String(cacheVersion || "1"),
-        assessModel: String(assessModel || ""),
-        limits: {
-          minQuotesPerPositivePass: Number(minQuotesPerPositivePass || 0),
-          requireDistinctEvidence:  !!requireDistinctEvidence,
-          maxEvidenceReuse:         Number(maxEvidenceReuse || 0),
-          enforceMaxWords:          !!enforceMaxWords,
-          bucketsInPrompt:          String(bucketsInPrompt || "none"),
-          bucketSampleN:            Number(bucketSampleN || 0)
-        },
-        skillName: String(skillName || ""),
-        rubric: rubricData || {},
-        whitelist: (whitelist || []).map(String),
-        indexKeyHash: String(indexKeyHash || "")
-      };
-      const stableStr = stable(input);
-      return await sha256Hex(stableStr);
-    }
+    const CACHE_VERSION = String(env.CACHE_VERSION || "1");
 
     const cachedStatus = {};
     await Promise.all(
       skills.map(async (skillName) => {
-        const rubricData = findRubricForSkill(rubrics, skillName);
-        if (!rubricData) { cachedStatus[skillName] = false; return; }
-
-        const wl = cachedIndex
-          ? selectWhitelistForSkill(
-              cachedIndex,
-              skillName,
-              WHITELIST_MAX,
-              normTranscript,
-              { maxQuoteWords: MAX_QUOTE_WORDS, enforce: ENFORCE_MAX_WORDS_IN_EVIDENCE }
-            )
-          : [];
-
-        const skillKeyHash = await buildAssessSkillKeyHash({
+        const skillKeyHash = await simpleSkillKeyHash({
           cacheVersion: CACHE_VERSION,
-          assessModel:  ASSESS_MODEL,
-          minQuotesPerPositivePass: num(env.MIN_QUOTES_PER_POSITIVE_PASS, 1),
-          requireDistinctEvidence:  bool(env.REQUIRE_DISTINCT_EVIDENCE, false),
-          maxEvidenceReuse:         num(env.MAX_EVIDENCE_REUSE, 5),
-          enforceMaxWords:          ENFORCE_MAX_WORDS_IN_EVIDENCE,
-          bucketsInPrompt:          String(env.BUCKETS_IN_PROMPT || "none").toLowerCase(),
-          bucketSampleN:            num(env.BUCKET_SAMPLE_N, 3),
-          skillName, rubricData, whitelist: wl,
-          indexKeyHash
+          transcript: normTranscript,
+          sellerId,
+          skillName
         });
-
         const kvKey = `v${CACHE_VERSION}:assess_skill:${skillKeyHash}`;
         const cached = env.ASSESS_CACHE ? await kvGetJSON(env.ASSESS_CACHE, kvKey) : null;
         cachedStatus[skillName] = !!(cached && cached.assessment && !cached.assessment.__error);
       })
     );
-
     return new Response(JSON.stringify(cachedStatus), { headers });
-
   } catch (error) {
     return new Response(JSON.stringify({ error: error.message }), { status: 500, headers });
   }
@@ -1142,31 +1087,26 @@ ${stable(sortedRubric)}
 ---`;
 }
 
-    function buildCoachingPrompt(skillName, rating, levelChecks, gatingSummary) {
+function buildCoachingPrompt(skillName, rating, levelChecks, gatingSummary, improvements) {
   return `
   You are an expert AI Sales Coach. The analysis for "${skillName}" has a final rating of ${rating}/5.
   Use ONLY this analysis (do not re-score):
-  ${stable({ level_checks: levelChecks, gating_summary: gatingSummary })}
+  ${stable({ level_checks: levelChecks, gating_summary: gatingSummary, improvements: improvements })}
 
   YOUR TASK:
   - Return ONLY JSON via extract_coaching_feedback.
   - 2-4 strengths (from highest achieved).
-  - 3-5 improvements (unmet positives at the next level).
+  - 3-5 improvements (based on the pre-filled improvements provided).
   - For each improvement, you MUST:
-    - Use a real, verbatim seller quote (or customer cue, if allowed) from the evidence for the unmet check as the 'instead_of'.
-    - The 'instead_of' must always be a real quote from the evidence array for the specific unmet check. Do not invent, paraphrase, or generalize.
+    - Use the provided 'instead_of' quote. **Do not change it.**
     - The 'try_this' suggestion must be a directional coaching instruction, based strictly on the actual evidence/quote used in 'instead_of'.
     - You are strictly forbidden from inventing, referencing, or describing any product features, solution capabilities, or benefits that are not explicitly present in the evidence. Do NOT make up or speculate about what the solution can do.
-    - If there is no relevant quote in the evidence for the unmet check, omit the improvement entirely (do not invent or hallucinate).
-  - 3-6 actionable coaching tips mapped to the improvements, each tip must be grounded in the actual evidence and not reference any features, capabilities, or benefits not present in the transcript.
+  - 3-6 actionable coaching tips mapped to the improvements.
 
   IMPORTANT:
-  - You must only use quotes that appear in the evidence for the unmet check when generating 'instead_of'.
-  - Do not invent, paraphrase, or generalize quotes. Use only what is present in the evidence.
-  - If no evidence is available for an improvement, omit that improvement.
-  - 'Try this' suggestions must be directly inspired by the actual quote in 'instead_of' and must not reference or invent any product features, solution capabilities, or benefits.
-  - Do not invent or hallucinate any suggestions, tips, or quotes. If there is no evidence, do not suggest anything.`;
-    }
+  - You must only use the quotes that appear in the provided 'improvements' when generating your response.
+  - Do not invent, paraphrase, or generalize quotes. Use only what is present.`;
+}
 
     // ===== Tool schemas (Gemini indexing only) -------
     const coachingTool = {
@@ -1227,85 +1167,66 @@ ${stable(sortedRubric)}
       return out;
     }
 
-    function pickRepresentativeEvidenceForCharacteristic(levelChecks, characteristic, exclude = new Set()) {
-      const all = flattenAllEvidence(levelChecks);
+    // A more robust evidence picker
+function pickRepresentativeEvidenceForCharacteristic(levelChecks, characteristic, exclude = new Set()) {
+  const all = flattenAllEvidence(levelChecks);
+
+  // 1. Prioritize a direct, MET, POSITIVE quote that isn't the target characteristic.
+  const positiveCandidates = all.filter(e =>
+      e.characteristic !== characteristic &&
+      e.polarity === 'positive' &&
+      e.met === true &&
+      e.quote &&
+      !exclude.has(e.quote)
+  ).sort((a, b) => b.level - a.level); // Highest level first
+
+  if (positiveCandidates.length > 0) {
+      return positiveCandidates[0].quote;
+  }
   
-      // Find all checks that are NOT the target characteristic but are related (same skill area)
-      // and were MET with POSITIVE polarity, and are NOT in the exclude set.
-      const candidates = all.filter(e =>
-          e.characteristic !== characteristic &&
-          e.polarity === 'positive' &&
-          e.met === true &&
-          e.quote &&
-          !exclude.has(e.quote)
-      ).sort((a, b) => b.level - a.level); // Sort by highest level first
-  
-      // 1. Prioritize a unique, high-level, positive quote.
-      if (candidates.length > 0) {
-          return candidates[0].quote;
-      }
-      
-      // 2. Fallback: If no unique quotes are left, find any MET positive quote, even if it's a repeat.
-      const anyMetPositive = all.find(e => e.polarity === 'positive' && e.met === true && e.quote);
-      if (anyMetPositive) return anyMetPositive.quote;
-  
-      // 3. Last resort fallback: Find any quote from a limitation.
-      const anyLimitation = all.find(e => e.polarity === 'limitation' && e.quote);
-      if (anyLimitation) return anyLimitation.quote;
-  
-      return ""; // Return empty if no suitable quotes are found at all.
+  // 2. Fallback: Find evidence from the HIGHEST-LEVEL MET LIMITATION.
+  // This often provides context for why the seller didn't reach the next positive level.
+  const limitationCandidates = all.filter(e =>
+    e.polarity === 'limitation' &&
+    e.met === true &&
+    e.quote
+  ).sort((a, b) => b.level - a.level); // Highest level first
+
+  if (limitationCandidates.length > 0) {
+    return limitationCandidates[0].quote;
   }
 
-  function backfillImprovementQuotes(improvements, levelChecks) {
-    // For each improvement, enforce that 'instead_of' is a real quote from the evidence for the corresponding unmet check.
-    // If not, replace it with the first available evidence quote for that check, or remove the improvement if none exists.
-    function findEvidenceQuoteForPoint(levelChecks, point) {
-      // Try to find the check whose characteristic matches the improvement point (or is similar)
-      for (const lvl of levelChecks || []) {
-        for (const check of lvl.checks || []) {
-          // Use loose match: point contains characteristic or vice versa
-          if (
-            (point && check.characteristic && (
-              point.toLowerCase().includes(check.characteristic.toLowerCase()) ||
-              check.characteristic.toLowerCase().includes(point.toLowerCase())
-            )) && Array.isArray(check.evidence) && check.evidence.length > 0
-          ) {
-            return check.evidence[0]; // Use the first evidence quote
-          }
+  // 3. Last resort: any other quote available.
+  const anyQuote = all.find(e => e.quote);
+  if (anyQuote) return anyQuote.quote;
+
+  return ""; // Return empty if no quotes are found anywhere.
+}
+
+
+// A more resilient backfill function
+function backfillImprovementQuotes(improvements, levelChecks) {
+  const usedEvidence = new Set();
+
+  return (improvements || []).map(impr => {
+    if (impr && impr.example) {
+      // If 'instead_of' is missing or seems generic, find a better quote.
+      if (!impr.example.instead_of || impr.example.instead_of.includes("The seller missed")) {
+        // Find a representative quote for the improvement point, excluding already used ones.
+        const evidenceQuote = pickRepresentativeEvidenceForCharacteristic(levelChecks, impr.point, usedEvidence);
+        
+        if (evidenceQuote) {
+          impr.example.instead_of = evidenceQuote;
+          usedEvidence.add(evidenceQuote); // Mark as used to avoid repetition
+        } else {
+          // If no quote can be found at all, make the 'instead_of' more descriptive.
+          impr.example.instead_of = `The seller missed a key opportunity to demonstrate this skill when the customer raised concerns.`;
         }
       }
-      return null;
     }
-
-    return (improvements || []).map(impr => {
-      if (impr && impr.example) {
-        // If 'instead_of' is missing or not in the evidence, enforce it
-        let validQuote = null;
-        if (!impr.example.instead_of) {
-          validQuote = findEvidenceQuoteForPoint(levelChecks, impr.point);
-        } else {
-          // Check if the provided 'instead_of' is actually in the evidence for the point
-          const quote = impr.example.instead_of;
-          const evidenceQuote = findEvidenceQuoteForPoint(levelChecks, impr.point);
-          if (evidenceQuote && quote !== evidenceQuote) {
-            validQuote = evidenceQuote;
-          } else {
-            validQuote = quote;
-          }
-        }
-        if (validQuote) {
-          impr.example.instead_of = validQuote;
-        } else {
-          // No valid evidence, remove 'instead_of' and 'try_this' to avoid hallucination
-          delete impr.example.instead_of;
-          if (impr.example.try_this) {
-            delete impr.example.try_this;
-          }
-        }
-      }
-      return impr;
-    });
-  }
+    return impr;
+  });
+}
 
 
     // ===== Gemini indexing only =====
@@ -1917,10 +1838,32 @@ parsedJudge = { level_checks: lc };
 
       const gating_summary = buildGatingSummary(levelChecks);
 
-      // ---- 2) COACH (Enforcing the schema - CORRECTED) ------------------------
-      const coachUser = buildCoachingPrompt(skillName, rating, levelChecks, gating_summary);
+      // ---- 2) COACH (CORRECTED LOGIC) ------------------------
+
+      // STEP 1: PRE-BUILD the improvements array based on unmet positives.
+      let improvements_template = [];
+      const nextLevel = gating_summary.find(lvl => lvl.level === rating + 1);
+      if (nextLevel && nextLevel.positives_unmet) {
+        for (const unmet_point of nextLevel.positives_unmet) {
+            improvements_template.push({
+                point: unmet_point,
+                example: {
+                    instead_of: "", // We will fill this in next
+                    try_this: ""
+                }
+            });
+        }
+      }
+
+      // STEP 2: BACKFILL the template with the best available evidence.
+      // This now happens BEFORE calling the coach.
+      const populated_improvements = backfillImprovementQuotes(improvements_template, levelChecks);
+
+      // STEP 3: BUILD the prompt with the now-populated data.
+      const coachUser = buildCoachingPrompt(skillName, rating, levelChecks, gating_summary, populated_improvements);
       promptBytes += bytes(coachUser);
    
+      // STEP 4: CALL the coach with the prepared data.
       const coachResp = await withRetry(() => chatOpenRouter(env, {
         model: env.WRITER_MODEL || "o4-mini",
         temperature: 0.2,
@@ -1931,25 +1874,22 @@ parsedJudge = { level_checks: lc };
             name: "coaching_feedback_schema",
             schema: {
               type: "object",
-              additionalProperties: false, // <-- FIX: Added this line
+              additionalProperties: false,
               properties: {
-                strengths: {
-                  type: "array",
-                  items: { type: "string" },
-                },
+                strengths: { type: "array", items: { type: "string" } },
                 improvements: {
                   type: "array",
                   items: {
                     type: "object",
-                    additionalProperties: false, // <-- FIX: Added this line
+                    additionalProperties: false,
                     properties: {
-                      point: { type: "string", description: "High-level area for improvement." },
+                      point: { type: "string" },
                       example: {
                         type: "object",
-                        additionalProperties: false, // <-- FIX: Added this line
+                        additionalProperties: false,
                         properties: {
-                          instead_of: { type: "string", description: "The seller's actual quote demonstrating the gap." },
-                          try_this: { type: "string", description: "A better, alternative phrase the seller could have used." }
+                          instead_of: { type: "string" },
+                          try_this: { type: "string" }
                         },
                         required: ["instead_of", "try_this"]
                       }
@@ -1957,10 +1897,7 @@ parsedJudge = { level_checks: lc };
                     required: ["point", "example"]
                   }
                 },
-                coaching_tips: {
-                  type: "array",
-                  items: { type: "string" },
-                }
+                coaching_tips: { type: "array", items: { type: "string" } }
               },
               required: ["strengths", "improvements", "coaching_tips"]
             }
@@ -1972,33 +1909,23 @@ parsedJudge = { level_checks: lc };
         ],
       }, { hint: "coach" }), { retries: 1 });
 
-promptBytes += bytes(coachUser);
-
-
-let strengths = [], improvements = [], coaching_tips = [];
-try {
-    // Robustly find and parse the JSON from the coach's response
-    let coachObj = null;
-    if (typeof coachResp.content === 'string' && coachResp.content.trim()) {
-        coachObj = JSON.parse(coachResp.content);
-    } else if (coachResp.json?.choices?.[0]?.message?.content) {
-        coachObj = JSON.parse(coachResp.json.choices[0].message.content);
-    } else if (coachResp.json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments) {
-        // Handle cases where coach might use tool calls
-        const toolArgs = coachResp.json.choices[0].message.tool_calls[0].function.arguments;
-        coachObj = JSON.parse(toolArgs);
-    }
-
-    if (coachObj) {
-        strengths = coachObj.strengths || [];
-        // Directly assign the full improvements array with the nested 'example' objects
-        improvements = coachObj.improvements || []; 
-        coaching_tips = coachObj.coaching_tips || [];
-    }
-} catch (e) {
-    console.log(`[coach:${skillName}] parse fail`, e);
-    // Gracefully fail, leaving coaching fields empty if parsing fails
-}
+      // STEP 5: Parse the final response.
+      let strengths = [], improvements = [], coaching_tips = [];
+      try {
+          let coachObj = null;
+          if (typeof coachResp.content === 'string' && coachResp.content.trim()) {
+              coachObj = JSON.parse(coachResp.content);
+          } else if (coachResp.json?.choices?.[0]?.message?.content) {
+              coachObj = JSON.parse(coachResp.json.choices[0].message.content);
+          }
+          if (coachObj) {
+              strengths = coachObj.strengths || [];
+              improvements = coachObj.improvements || []; 
+              coaching_tips = coachObj.coaching_tips || [];
+          }
+      } catch (e) {
+          console.log(`[coach:${skillName}] parse fail`, e);
+      }
 
 // populate the 'instead_of' quotes 👇
 improvements = backfillImprovementQuotes(improvements, levelChecks);
@@ -2110,15 +2037,7 @@ improvements = backfillImprovementQuotes(improvements, levelChecks);
           { maxQuoteWords: MAX_QUOTE_WORDS, enforce: ENFORCE_MAX_WORDS_IN_EVIDENCE }
         );
     
-        const skillKeyHash = await sha256Hex(stable({
-          v: CACHE_VERSION,
-          assessModel: "openrouter",
-          limits: { MIN_QUOTES_PER_POSITIVE_PASS, REQUIRE_DISTINCT_EVIDENCE, MAX_EVIDENCE_REUSE, ENFORCE_MAX_WORDS_IN_EVIDENCE },
-          skillName,
-          rubric: rubricData,
-          whitelist: wl,
-          indexKeyHash
-        }));
+        const skillKeyHash = await simpleSkillKeyHash({ cacheVersion: CACHE_VERSION, transcript, sellerId, skillName });
     
         const kvKey = `v${CACHE_VERSION}:assess_skill:${skillKeyHash}`;
     
