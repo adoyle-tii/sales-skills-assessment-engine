@@ -1670,7 +1670,7 @@ ${stable(sortedRubric)}
           level_checks: [], gating_summary: [],
           _debug: { missing_rubric: true },
           _raw_model_output: [],
-          _served_by: { judge: env.JUDGE_MODEL || "mistralai/mixtral-8x7b-instruct", coach: env.WRITER_MODEL || "openai/o4-mini" }
+          _served_by: { judge: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct", coach: env.WRITER_MODEL || "openai/o4-mini" }
         });
       }
 
@@ -1691,7 +1691,7 @@ ${stable(sortedRubric)}
           gating_summary: [],
           _debug: { malformed_rubric: true, lvlCount, totalChecks },
           _raw_model_output: [],
-          _served_by: { judge: env.JUDGE_MODEL || "mistralai/mixtral-8x7b-instruct", coach: env.WRITER_MODEL || "openai/o4-mini" }
+          _served_by: { judge: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct", coach: env.WRITER_MODEL || "openai/o4-mini" }
         });
       }
 
@@ -1738,7 +1738,7 @@ ${stable(sortedRubric)}
 
       // ---- 1) JUDGE ----------------------
       const judgeResp = await withRetry(() => chatOpenRouter(env, {
-  model: env.JUDGE_MODEL || "mistralai/mixtral-8x7b-instruct",
+  model: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct",
         temperature: 0.1,
         max_tokens: 8000,
         tools: [{
@@ -2014,7 +2014,7 @@ improvements = backfillImprovementQuotes(improvements, levelChecks);
         level_checks: levelChecks, gating_summary,
         _debug: { ratingRaw, ratingSanitized, metRaw, metAfter, evidenceLossRatio },
         _raw_model_output: rawLevelChecks,
-  _served_by: { judge: env.JUDGE_MODEL || "mistralai/mixtral-8x7b-instruct", coach: env.WRITER_MODEL || "openai/o4-mini" }
+  _served_by: { judge: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct", coach: env.WRITER_MODEL || "openai/o4-mini" }
       }, { judgeResp, coachResp });
     }
 
@@ -2156,7 +2156,7 @@ improvements = backfillImprovementQuotes(improvements, levelChecks);
       assess_model: "openrouter",
       index_model: INDEX_MODEL,
       writer_model: env.WRITER_MODEL || "openai/o4-mini",
-  judge_model: env.JUDGE_MODEL || "mistralai/mixtral-8x7b-instruct",
+  judge_model: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct",
       provider_order: (env.PROVIDER_ORDER || "fireworks,together,groq,google,openai"),
       allow_fallbacks: providerPrefs(env).allow_fallbacks,
       kv_enabled: !!env.ASSESS_CACHE,
