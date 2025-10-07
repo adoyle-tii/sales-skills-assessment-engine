@@ -1249,12 +1249,10 @@ ${stable(sortedRubric)}
         .filter(e => e.polarity === 'positive' && e.met === true && e.quote)
         .sort((a, b) => b.level - a.level); // Sort descending to prioritize higher-level skills.
 
-    // If there are no met positives (e.g., rating is 1), use any quotes from level 1 (any polarity, any met status)
+    // If there are no met positives (e.g., rating is 1), use all evidence objects from level 1 (any polarity, any met status)
     if (metPositiveChecks.length === 0) {
-        const level1Quotes = flattenAllEvidence(levelChecks)
-            .filter(e => e.level === 1 && e.quote)
-            .map(e => e.quote);
-        metPositiveChecks = level1Quotes.map(q => ({ quote: q }));
+        metPositiveChecks = flattenAllEvidence(levelChecks)
+            .filter(e => e.level === 1 && e.quote);
     }
 
     // 2. Extract just the unique quotes into a list to prevent duplicates.
@@ -1888,7 +1886,7 @@ parsedJudge = { level_checks: lc };
       promptBytes += bytes(coachUser);
    
       const coachResp = await withRetry(() => chatOpenRouter(env, {
-        model: env.WRITER_MODEL || "openai/gpt-4o-mini",
+        model: env.WRITER_MODEL || "o4-mini",
         temperature: 0.2,
         max_tokens: 4096,
         response_format: {
