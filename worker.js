@@ -1270,6 +1270,10 @@ ${stable(sortedRubric)}
       } else {
         // No available quote, so remove the property
         delete impr.example.instead_of;
+        // Also remove 'try_this' if there is no evidence, to avoid hallucinated suggestions
+        if (impr.example.try_this) {
+          delete impr.example.try_this;
+        }
       }
     }
     return impr;
