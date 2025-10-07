@@ -1147,24 +1147,25 @@ ${stable(sortedRubric)}
   You are an expert AI Sales Coach. The analysis for "${skillName}" has a final rating of ${rating}/5.
   Use ONLY this analysis (do not re-score):
   ${stable({ level_checks: levelChecks, gating_summary: gatingSummary })}
-  
+
   YOUR TASK:
   - Return ONLY JSON via extract_coaching_feedback.
   - 2-4 strengths (from highest achieved).
   - 3-5 improvements (unmet positives at the next level).
   - For each improvement, you MUST:
     - Use a real, verbatim seller quote (or customer cue, if allowed) from the evidence for the unmet check as the 'instead_of'.
-    - The 'instead_of' must always be a real quote from the evidence array for the specific unmet check. Do not invent or paraphrase.
-    - The 'try_this' suggestion must be directly based on the actual evidence/quote used in 'instead_of'.
+    - The 'instead_of' must always be a real quote from the evidence array for the specific unmet check. Do not invent, paraphrase, or generalize.
+    - The 'try_this' suggestion must be a directional coaching instruction, based strictly on the actual evidence/quote used in 'instead_of'.
+    - You are strictly forbidden from inventing, referencing, or describing any product features, solution capabilities, or benefits that are not explicitly present in the evidence. Do NOT make up or speculate about what the solution can do.
     - If there is no relevant quote in the evidence for the unmet check, omit the improvement entirely (do not invent or hallucinate).
-  - 3-6 actionable coaching tips mapped to the improvements.
-  
+  - 3-6 actionable coaching tips mapped to the improvements, each tip must be grounded in the actual evidence and not reference any features, capabilities, or benefits not present in the transcript.
+
   IMPORTANT:
   - You must only use quotes that appear in the evidence for the unmet check when generating 'instead_of'.
   - Do not invent, paraphrase, or generalize quotes. Use only what is present in the evidence.
   - If no evidence is available for an improvement, omit that improvement.
-  - 'Try this' suggestions must be directly inspired by the actual quote in 'instead_of'.
-  - Do not invent or hallucinate any suggestions or quotes.`;
+  - 'Try this' suggestions must be directly inspired by the actual quote in 'instead_of' and must not reference or invent any product features, solution capabilities, or benefits.
+  - Do not invent or hallucinate any suggestions, tips, or quotes. If there is no evidence, do not suggest anything.`;
     }
 
     // ===== Tool schemas (Gemini indexing only) -------
