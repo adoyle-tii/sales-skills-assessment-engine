@@ -1147,17 +1147,24 @@ ${stable(sortedRubric)}
   You are an expert AI Sales Coach. The analysis for "${skillName}" has a final rating of ${rating}/5.
   Use ONLY this analysis (do not re-score):
   ${stable({ level_checks: levelChecks, gating_summary: gatingSummary })}
-      
+  
   YOUR TASK:
   - Return ONLY JSON via extract_coaching_feedback.
   - 2-4 strengths (from highest achieved).
-  - 3-5 improvements (unmet positives at the next level), include a concise supporting quote when available.
+  - 3-5 improvements (unmet positives at the next level).
+  - For each improvement, you MUST:
+    - Use a real, verbatim seller quote (or customer cue, if allowed) from the evidence for the unmet check as the 'instead_of'.
+    - The 'instead_of' must always be a real quote from the evidence array for the specific unmet check. Do not invent or paraphrase.
+    - The 'try_this' suggestion must be directly based on the actual evidence/quote used in 'instead_of'.
+    - If there is no relevant quote in the evidence for the unmet check, omit the improvement entirely (do not invent or hallucinate).
   - 3-6 actionable coaching tips mapped to the improvements.
-      
+  
   IMPORTANT:
-  - For each improvement, only provide a 'Try this' suggestion if there is a relevant seller quote or evidence in the analysis.
-  - If there is no relevant seller quote or evidence for an improvement, OMIT the 'Try this' suggestion for that point (do not invent or hallucinate).
-  - 'Try this' suggestions must be directly inspired by the seller's actual statements in the transcript. If no such statement exists, omit the suggestion.`;
+  - You must only use quotes that appear in the evidence for the unmet check when generating 'instead_of'.
+  - Do not invent, paraphrase, or generalize quotes. Use only what is present in the evidence.
+  - If no evidence is available for an improvement, omit that improvement.
+  - 'Try this' suggestions must be directly inspired by the actual quote in 'instead_of'.
+  - Do not invent or hallucinate any suggestions or quotes.`;
     }
 
     // ===== Tool schemas (Gemini indexing only) -------
@@ -1249,41 +1256,54 @@ ${stable(sortedRubric)}
   }
 
   function backfillImprovementQuotes(improvements, levelChecks) {
-    // 1. Find all available "gap" quotes from positive skills the seller actually MET.
-    //    These are the best examples of what the seller did "instead of" the mastery-level skill.
-    let metPositiveChecks = flattenAllEvidence(levelChecks)
-        .filter(e => e.polarity === 'positive' && e.met === true && e.quote)
-        .sort((a, b) => b.level - a.level); // Sort descending to prioritize higher-level skills.
-
-    // If there are no met positives (e.g., rating is 1), use all evidence objects from level 1 (any polarity, any met status)
-    if (metPositiveChecks.length === 0) {
-        metPositiveChecks = flattenAllEvidence(levelChecks)
-            .filter(e => e.level === 1 && e.quote);
-    }
-
-    // 2. Extract just the unique quotes into a list to prevent duplicates.
-    const availableQuotes = [...new Set(metPositiveChecks.map(e => e.quote))];
-    let quoteIndex = 0;
-
-    // 3. Map over the improvements and fill in the blank 'instead_of' fields sequentially.
-  return (improvements || []).map(impr => {
-    if (impr && impr.example && !impr.example.instead_of) {
-      if (quoteIndex < availableQuotes.length) {
-        impr.example.instead_of = availableQuotes[quoteIndex];
-        quoteIndex++;
-      } else if (availableQuotes.length > 0) {
-        impr.example.instead_of = availableQuotes[availableQuotes.length - 1];
-      } else {
-        // No available quote, so remove the property
-        delete impr.example.instead_of;
-        // Also remove 'try_this' if there is no evidence, to avoid hallucinated suggestions
-        if (impr.example.try_this) {
-          delete impr.example.try_this;
+    // For each improvement, enforce that 'instead_of' is a real quote from the evidence for the corresponding unmet check.
+    // If not, replace it with the first available evidence quote for that check, or remove the improvement if none exists.
+    function findEvidenceQuoteForPoint(levelChecks, point) {
+      // Try to find the check whose characteristic matches the improvement point (or is similar)
+      for (const lvl of levelChecks || []) {
+        for (const check of lvl.checks || []) {
+          // Use loose match: point contains characteristic or vice versa
+          if (
+            (point && check.characteristic && (
+              point.toLowerCase().includes(check.characteristic.toLowerCase()) ||
+              check.characteristic.toLowerCase().includes(point.toLowerCase())
+            )) && Array.isArray(check.evidence) && check.evidence.length > 0
+          ) {
+            return check.evidence[0]; // Use the first evidence quote
+          }
         }
       }
+      return null;
     }
-    return impr;
-  });
+
+    return (improvements || []).map(impr => {
+      if (impr && impr.example) {
+        // If 'instead_of' is missing or not in the evidence, enforce it
+        let validQuote = null;
+        if (!impr.example.instead_of) {
+          validQuote = findEvidenceQuoteForPoint(levelChecks, impr.point);
+        } else {
+          // Check if the provided 'instead_of' is actually in the evidence for the point
+          const quote = impr.example.instead_of;
+          const evidenceQuote = findEvidenceQuoteForPoint(levelChecks, impr.point);
+          if (evidenceQuote && quote !== evidenceQuote) {
+            validQuote = evidenceQuote;
+          } else {
+            validQuote = quote;
+          }
+        }
+        if (validQuote) {
+          impr.example.instead_of = validQuote;
+        } else {
+          // No valid evidence, remove 'instead_of' and 'try_this' to avoid hallucination
+          delete impr.example.instead_of;
+          if (impr.example.try_this) {
+            delete impr.example.try_this;
+          }
+        }
+      }
+      return impr;
+    });
   }
 
 
