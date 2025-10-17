@@ -354,6 +354,113 @@ function pickQuote(quotes = []) {
   return "";
 }
 
+function normalizeCoachStrengths(strengths, fallback = []) {
+  const normalized = [];
+  for (const item of strengths || []) {
+    if (!item) continue;
+    if (typeof item === "string") {
+      const text = item.trim();
+      if (text) {
+        normalized.push({ level: null, characteristic: text, quote: "" });
+      }
+      continue;
+    }
+    if (typeof item === "object") {
+      const level = item.level ?? item.level_label ?? item.levelName ?? item.level_number ?? null;
+      const characteristic =
+        typeof item.characteristic === "string"
+          ? item.characteristic
+          : typeof item.name === "string"
+          ? item.name
+          : typeof item.point === "string"
+          ? item.point
+          : typeof item.title === "string"
+          ? item.title
+          : typeof item.label === "string"
+          ? item.label
+          : null;
+      let quote = "";
+      if (typeof item.quote === "string") {
+        quote = item.quote;
+      } else if (typeof item.example?.instead_of === "string") {
+        quote = item.example.instead_of;
+      } else if (typeof item.example?.quote === "string") {
+        quote = item.example.quote;
+      } else if (typeof item.instead_of === "string") {
+        quote = item.instead_of;
+      }
+      if (characteristic || quote) {
+        normalized.push({
+          level: level ?? null,
+          characteristic: characteristic ? String(characteristic).trim() : "",
+          quote: quote ? String(quote).trim() : "",
+        });
+      }
+    }
+  }
+  if (normalized.length > 0) return normalized;
+  return Array.isArray(fallback) ? fallback : [];
+}
+
+function normalizeCoachImprovements(improvements, fallback = []) {
+  const normalized = [];
+  for (const item of improvements || []) {
+    if (!item) continue;
+    if (typeof item === "string") {
+      const text = item.trim();
+      if (text) {
+        normalized.push({ level: null, characteristic: text, quote: "", reason: text });
+      }
+      continue;
+    }
+    if (typeof item === "object") {
+      const level = item.level ?? item.level_label ?? item.levelName ?? item.level_number ?? null;
+      const characteristic =
+        typeof item.characteristic === "string"
+          ? item.characteristic
+          : typeof item.point === "string"
+          ? item.point
+          : typeof item.name === "string"
+          ? item.name
+          : typeof item.title === "string"
+          ? item.title
+          : typeof item.label === "string"
+          ? item.label
+          : null;
+      let quote = "";
+      if (typeof item.quote === "string") {
+        quote = item.quote;
+      } else if (typeof item.example?.instead_of === "string") {
+        quote = item.example.instead_of;
+      } else if (typeof item.example?.quote === "string") {
+        quote = item.example.quote;
+      } else if (typeof item.instead_of === "string") {
+        quote = item.instead_of;
+      }
+      const reason =
+        typeof item.reason === "string"
+          ? item.reason
+          : typeof item.explanation === "string"
+          ? item.explanation
+          : typeof item.example?.context === "string"
+          ? item.example.context
+          : typeof item.context === "string"
+          ? item.context
+          : "";
+      if (characteristic || quote || reason) {
+        normalized.push({
+          level: level ?? null,
+          characteristic: characteristic ? String(characteristic).trim() : "",
+          quote: quote ? String(quote).trim() : "",
+          reason: reason ? String(reason).trim() : "",
+        });
+      }
+    }
+  }
+  if (normalized.length > 0) return normalized;
+  return Array.isArray(fallback) ? fallback : [];
+}
+
 function buildJudgePrompt(skillName, rubric, transcript, eligibility) {
   const rubricText = stable(normalizeRubric(rubric));
   const quotes = Array.isArray(eligibility?.quotes) ? eligibility.quotes : [];
@@ -405,6 +512,83 @@ ${stable(payload)}
 
 Generate JSON via extract_coaching_feedback following the schema in the system prompt. Use the provided quotes exactly as written for 'instead_of'. If a gap has no quote, explain the moment succinctly in place of the quote.
 `;
+}
+
+async function generateCoachingFeedback(env, skillName, rating, strengths, improvements, { hint = "coach" } = {}) {
+  const coachPrompt = buildCoachPrompt(skillName, rating, strengths, improvements);
+
+  const coachResp = await withRetry(
+    () =>
+      chatOpenRouter(env, {
+        model: env.WRITER_MODEL || "openai/gpt-4o-mini",
+        temperature: 0.2,
+        max_tokens: 4000,
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "coaching_feedback_schema",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                strengths: { type: "array", items: { type: "string" } },
+                improvements: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      point: { type: "string" },
+                      example: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                          instead_of: { type: "string" },
+                          try_this: { type: "string" },
+                        },
+                        required: ["instead_of", "try_this"],
+                      },
+                    },
+                    required: ["point", "example"],
+                  },
+                },
+                coaching_tips: { type: "array", items: { type: "string" } },
+              },
+              required: ["strengths", "improvements", "coaching_tips"],
+            },
+          },
+        },
+        messages: [
+          { role: "system", content: OR_SYSTEM_COACH },
+          { role: "user", content: coachPrompt },
+        ],
+        provider: providerPrefs(env),
+      }, { hint }),
+    { retries: 1, baseMs: 600 }
+  );
+
+  let coachJSON = null;
+  try {
+    if (coachResp?.json?.choices?.[0]?.message?.content) {
+      coachJSON = JSON.parse(coachResp.json.choices[0].message.content);
+    } else if (typeof coachResp?.content === "string" && coachResp.content.trim()) {
+      coachJSON = JSON.parse(coachResp.content);
+    }
+  } catch (err) {
+    console.log(`[coach:${skillName}] parse error`, err);
+  }
+
+  const strengthsList = Array.isArray(coachJSON?.strengths) ? coachJSON.strengths : [];
+  const improvementsList = Array.isArray(coachJSON?.improvements) ? coachJSON.improvements : [];
+  const coachingTips = Array.isArray(coachJSON?.coaching_tips) ? coachJSON.coaching_tips : [];
+
+  return {
+    strengths: strengthsList,
+    improvements: improvementsList,
+    coaching_tips: coachingTips,
+    servedBy: coachResp?.servedBy || null,
+    promptChars: coachPrompt.length,
+  };
 }
 
 function buildEligibilityPrompt(skills, transcript) {
@@ -618,6 +802,8 @@ export default {
       handler = handlePreAssessment;
     } else if (url.pathname === "/check-cache-status") {
       handler = handleCacheCheck;
+    } else if (url.pathname === "/coach") {
+      handler = handleCoachOnly;
     } else {
       handler = handleFullAssessment;
     }
@@ -718,6 +904,113 @@ async function handleCacheCheck(request, env) {
     );
 
     return new Response(JSON.stringify(status), { headers });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers });
+  }
+}
+
+async function handleCoachOnly(request, env) {
+  const headers = { "Content-Type": "application/json; charset=utf-8" };
+  try {
+    const body = await request.json().catch(() => ({}));
+    const analysis = (body && typeof body.analysis === "object" && body.analysis) || {};
+
+    const skillName = String(body?.skill || body?.skillName || body?.skill_name || analysis?.skill || "").trim();
+    if (!skillName) {
+      return new Response(JSON.stringify({ error: "Missing 'skill' in request body." }), { status: 400, headers });
+    }
+
+    const ratingCandidates = [body?.rating, body?.score, analysis?.rating, analysis?.score];
+    let rating = null;
+    for (const candidate of ratingCandidates) {
+      const value = Number(candidate);
+      if (Number.isFinite(value)) {
+        rating = value;
+        break;
+      }
+    }
+
+    const levelChecksRaw =
+      Array.isArray(body?.level_checks)
+        ? body.level_checks
+        : Array.isArray(body?.levelChecks)
+        ? body.levelChecks
+        : Array.isArray(analysis?.level_checks)
+        ? analysis.level_checks
+        : Array.isArray(analysis?.levelChecks)
+        ? analysis.levelChecks
+        : null;
+
+    const levelChecks = Array.isArray(levelChecksRaw) ? levelChecksRaw : null;
+    const providedStrengths =
+      Array.isArray(body?.strengths)
+        ? body.strengths
+        : Array.isArray(analysis?.strengths)
+        ? analysis.strengths
+        : null;
+    const providedImprovements =
+      Array.isArray(body?.improvements)
+        ? body.improvements
+        : Array.isArray(analysis?.improvements)
+        ? analysis.improvements
+        : Array.isArray(analysis?.improvement_opportunities)
+        ? analysis.improvement_opportunities
+        : null;
+
+    const strengthFallback = levelChecks
+      ? collectStrengthCandidates(levelChecks)
+          .slice(0, 6)
+          .map((item) => ({
+            level: item.level,
+            characteristic: item.characteristic,
+            quote: pickQuote(item.evidence),
+          }))
+      : [];
+    const improvementFallback = levelChecks
+      ? collectImprovementSeeds(levelChecks)
+          .slice(0, 8)
+          .map((item) => ({
+            level: item.level,
+            characteristic: item.characteristic,
+            quote: pickQuote(item.evidence),
+            reason: item.reason,
+          }))
+      : [];
+
+    const strengthsSnapshot = normalizeCoachStrengths(providedStrengths, strengthFallback);
+    const improvementSnapshot = normalizeCoachImprovements(providedImprovements, improvementFallback);
+
+    if (!Number.isFinite(rating) && levelChecks) {
+      rating = computeRating(levelChecks);
+    }
+
+    const ratingForPrompt = Number.isFinite(rating) ? rating : 0;
+
+    const feedback = await generateCoachingFeedback(
+      env,
+      skillName,
+      ratingForPrompt,
+      strengthsSnapshot,
+      improvementSnapshot,
+      { hint: "coach-roleplay" }
+    );
+
+    const responsePayload = {
+      skill: skillName,
+      rating: Number.isFinite(rating) ? rating : null,
+      strengths: feedback.strengths,
+      improvements: feedback.improvements,
+      coaching_tips: feedback.coaching_tips,
+      _served_by: { coach: feedback.servedBy || null },
+      _prompts: { coach_chars: feedback.promptChars },
+      meta: {
+        provided_level_checks: levelChecks ? levelChecks.length : 0,
+        input_strengths: Array.isArray(providedStrengths) ? providedStrengths.length : 0,
+        input_improvements: Array.isArray(providedImprovements) ? providedImprovements.length : 0,
+      },
+    };
+
+    return new Response(JSON.stringify(responsePayload), { headers });
   } catch (error) {
     return new Response(JSON.stringify({ error: error.message }), { status: 500, headers });
   }
@@ -1090,72 +1383,13 @@ async function assessSkill({
     reason: item.reason,
   }));
 
-  const coachPrompt = buildCoachPrompt(skillName, rating, strengthsSnapshot, improvementSnapshot);
+  const coachFeedback = await generateCoachingFeedback(env, skillName, rating, strengthsSnapshot, improvementSnapshot, {
+    hint: "coach",
+  });
 
-  const coachResp = await withRetry(
-    () =>
-      chatOpenRouter(env, {
-        model: env.WRITER_MODEL || "openai/gpt-4o-mini",
-        temperature: 0.2,
-        max_tokens: 4000,
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "coaching_feedback_schema",
-            schema: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                strengths: { type: "array", items: { type: "string" } },
-                improvements: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    additionalProperties: false,
-                    properties: {
-                      point: { type: "string" },
-                      example: {
-                        type: "object",
-                        additionalProperties: false,
-                        properties: {
-                          instead_of: { type: "string" },
-                          try_this: { type: "string" },
-                        },
-                        required: ["instead_of", "try_this"],
-                      },
-                    },
-                    required: ["point", "example"],
-                  },
-                },
-                coaching_tips: { type: "array", items: { type: "string" } },
-              },
-              required: ["strengths", "improvements", "coaching_tips"],
-            },
-          },
-        },
-        messages: [
-          { role: "system", content: OR_SYSTEM_COACH },
-          { role: "user", content: coachPrompt },
-        ],
-        provider: providerPrefs(env),
-      }, { hint: "coach" }),
-    { retries: 1, baseMs: 600 }
-  );
-
-  let coachJSON = null;
-  try {
-    if (coachResp?.json?.choices?.[0]?.message?.content) {
-      coachJSON = JSON.parse(coachResp.json.choices[0].message.content);
-    } else if (typeof coachResp?.content === "string" && coachResp.content.trim()) {
-      coachJSON = JSON.parse(coachResp.content);
-    }
-  } catch (err) {
-    console.log(`[coach:${skillName}] parse error`, err);
-  }
-
-  const strengths = Array.isArray(coachJSON?.strengths) ? coachJSON.strengths : [];
-  const improvements = Array.isArray(coachJSON?.improvements) ? coachJSON.improvements : [];
-  const coaching_tips = Array.isArray(coachJSON?.coaching_tips) ? coachJSON.coaching_tips : [];
+  const strengths = coachFeedback.strengths;
+  const improvements = coachFeedback.improvements;
+  const coaching_tips = coachFeedback.coaching_tips;
 
   const assessment = {
     skill: skillName,
@@ -1167,11 +1401,11 @@ async function assessSkill({
     gating_summary: gatingSummary,
     _served_by: {
       judge: judgeResp?.servedBy || null,
-      coach: coachResp?.servedBy || null,
+      coach: coachFeedback.servedBy || null,
     },
     _prompts: {
       judge_chars: judgePrompt.length,
-      coach_chars: coachPrompt.length,
+      coach_chars: coachFeedback.promptChars,
     },
   };
 
