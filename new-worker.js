@@ -155,7 +155,8 @@ async function chatOpenRouter(env, payload, { hint = "openrouter" } = {}) {
   return { json, raw, content, servedBy };
 }
 
-async function callGeminiJSON(env, prompt, { model, hint = "gemini", temperature = 0 } = {}) {
+async function callGeminiJSON(env, prompt, options = {}) {
+  const { model, hint = "gemini", temperature = 0 } = options || {};
   const GEMINI_API_KEY = env.GEMINI_API_KEY;
   if (!GEMINI_API_KEY) {
     throw new Error(`${hint} missing GEMINI_API_KEY`);
@@ -954,7 +955,7 @@ async function handleFullAssessment(request, env, url) {
     assessed_skills: orderedAssessments.map((a) => a.skill),
     requested_skills: resolvedSkills.map((entry) => entry.skillName),
     blocked_skills: blockedSkillsSorted,
-    missing_skills,
+    missing_skills: missingSkills,
     token_estimate: transcriptTokenEstimate(transcript),
     timing,
     eligibility: {
