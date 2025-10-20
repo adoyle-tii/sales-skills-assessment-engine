@@ -354,6 +354,142 @@ function pickQuote(quotes = []) {
   return "";
 }
 
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return "";
+}
+
+function firstFiniteNumber(...values) {
+  for (const value of values) {
+    const numValue = Number(value);
+    if (Number.isFinite(numValue)) {
+      return numValue;
+    }
+  }
+  return null;
+}
+
+function pickArrayCandidate(...values) {
+  for (const value of values) {
+    if (Array.isArray(value)) return value;
+  }
+  return null;
+}
+
+function pickLevelChecksCandidate(value) {
+  if (!Array.isArray(value)) return null;
+  const filtered = value.filter((item) => item && typeof item === "object");
+  return filtered.length ? filtered : null;
+}
+
+function skillCandidateStrings(source) {
+  const values = [];
+  const consider = (candidate) => {
+    if (typeof candidate === "string") {
+      const trimmed = candidate.trim();
+      if (trimmed) values.push(trimmed);
+    } else if (candidate && typeof candidate === "object") {
+      consider(candidate.name);
+      consider(candidate.title);
+      consider(candidate.label);
+    }
+  };
+  if (!source) return values;
+  if (typeof source === "string") {
+    consider(source);
+    return values;
+  }
+  consider(source.skill);
+  consider(source.skillName);
+  consider(source.skill_name);
+  consider(source.name);
+  consider(source.title);
+  consider(source.label);
+  consider(source.skill_label);
+  return values;
+}
+
+function normalizeCoachRequestPayload(payload, fallback = {}) {
+  if (typeof payload === "string") {
+    const skill = payload.trim();
+    if (!skill) return null;
+    const fb = fallback && typeof fallback === "object" ? fallback : {};
+    return {
+      skillName: skill,
+      rating: firstFiniteNumber(fb.rating, fb.score, fb.final_rating, fb.finalScore),
+      levelChecks:
+        pickLevelChecksCandidate(fb.level_checks) || pickLevelChecksCandidate(fb.levelChecks) || null,
+      strengths: pickArrayCandidate(fb.strengths),
+      improvements: pickArrayCandidate(fb.improvements, fb.improvement_opportunities),
+      hint: firstNonEmptyString(fb.hint),
+    };
+  }
+
+  const base = payload && typeof payload === "object" ? payload : {};
+  const fb = fallback && typeof fallback === "object" ? fallback : {};
+  const analysis = base.analysis && typeof base.analysis === "object" ? base.analysis : fb.analysis;
+
+  const skillName = firstNonEmptyString(
+    ...skillCandidateStrings(base),
+    ...skillCandidateStrings(analysis),
+    ...skillCandidateStrings(fb)
+  );
+  if (!skillName) return null;
+
+  const rating = firstFiniteNumber(
+    base.rating,
+    base.score,
+    base.final_rating,
+    base.finalScore,
+    base.level,
+    analysis?.rating,
+    analysis?.score,
+    analysis?.final_rating,
+    analysis?.finalScore,
+    fb.rating,
+    fb.score,
+    fb.final_rating,
+    fb.finalScore
+  );
+
+  const levelChecks =
+    pickLevelChecksCandidate(base.level_checks) ||
+    pickLevelChecksCandidate(base.levelChecks) ||
+    pickLevelChecksCandidate(analysis?.level_checks) ||
+    pickLevelChecksCandidate(analysis?.levelChecks) ||
+    pickLevelChecksCandidate(fb.level_checks) ||
+    pickLevelChecksCandidate(fb.levelChecks) ||
+    null;
+
+  const strengths =
+    pickArrayCandidate(base.strengths) ||
+    pickArrayCandidate(analysis?.strengths) ||
+    pickArrayCandidate(base.highlights) ||
+    pickArrayCandidate(base.positives) ||
+    pickArrayCandidate(fb.strengths) ||
+    null;
+
+  const improvements =
+    pickArrayCandidate(base.improvements) ||
+    pickArrayCandidate(analysis?.improvements) ||
+    pickArrayCandidate(analysis?.improvement_opportunities) ||
+    pickArrayCandidate(base.improvement_opportunities) ||
+    pickArrayCandidate(base.gaps) ||
+    pickArrayCandidate(base.opportunities) ||
+    pickArrayCandidate(fb.improvements) ||
+    pickArrayCandidate(fb.improvement_opportunities) ||
+    null;
+
+  const hint = firstNonEmptyString(base.hint, base.coach_hint, fb.hint);
+
+  return { skillName, rating, levelChecks, strengths, improvements, hint };
+}
+
 function normalizeCoachStrengths(strengths, fallback = []) {
   const normalized = [];
   for (const item of strengths || []) {
@@ -909,107 +1045,104 @@ async function handleCacheCheck(request, env) {
   }
 }
 
+async function executeCoachRequest(env, normalized, { defaultHint = "coach-roleplay" } = {}) {
+  const levelChecks = Array.isArray(normalized?.levelChecks) ? normalized.levelChecks : null;
+  const strengthFallback = levelChecks
+    ? collectStrengthCandidates(levelChecks)
+        .slice(0, 6)
+        .map((item) => ({
+          level: item.level,
+          characteristic: item.characteristic,
+          quote: pickQuote(item.evidence),
+        }))
+    : [];
+  const improvementFallback = levelChecks
+    ? collectImprovementSeeds(levelChecks)
+        .slice(0, 8)
+        .map((item) => ({
+          level: item.level,
+          characteristic: item.characteristic,
+          quote: pickQuote(item.evidence),
+          reason: item.reason,
+        }))
+    : [];
+
+  const strengthsSnapshot = normalizeCoachStrengths(normalized?.strengths, strengthFallback);
+  const improvementSnapshot = normalizeCoachImprovements(normalized?.improvements, improvementFallback);
+
+  let rating = Number.isFinite(normalized?.rating) ? normalized.rating : null;
+  if (!Number.isFinite(rating) && levelChecks) {
+    rating = computeRating(levelChecks);
+  }
+  const ratingForPrompt = Number.isFinite(rating) ? rating : 0;
+
+  const feedback = await generateCoachingFeedback(
+    env,
+    normalized.skillName,
+    ratingForPrompt,
+    strengthsSnapshot,
+    improvementSnapshot,
+    { hint: normalized?.hint || defaultHint }
+  );
+
+  return {
+    skill: normalized.skillName,
+    rating: Number.isFinite(rating) ? rating : null,
+    strengths: feedback.strengths,
+    improvements: feedback.improvements,
+    coaching_tips: feedback.coaching_tips,
+    _served_by: { coach: feedback.servedBy || null },
+    _prompts: { coach_chars: feedback.promptChars },
+    meta: {
+      provided_level_checks: levelChecks ? levelChecks.length : 0,
+      input_strengths: Array.isArray(normalized?.strengths) ? normalized.strengths.length : 0,
+      input_improvements: Array.isArray(normalized?.improvements) ? normalized.improvements.length : 0,
+    },
+  };
+}
+
 async function handleCoachOnly(request, env) {
   const headers = { "Content-Type": "application/json; charset=utf-8" };
   try {
     const body = await request.json().catch(() => ({}));
     const analysis = (body && typeof body.analysis === "object" && body.analysis) || {};
 
-    const skillName = String(body?.skill || body?.skillName || body?.skill_name || analysis?.skill || "").trim();
-    if (!skillName) {
+    const skillCollections = [body?.skills, body?.assessedSkills, analysis?.skills, analysis?.assessedSkills];
+    const skillArray = skillCollections.find((value) => Array.isArray(value) && value.length > 0) || null;
+
+    if (skillArray) {
+      const normalizedRequests = skillArray
+        .map((item) => normalizeCoachRequestPayload(item, body))
+        .filter(Boolean);
+
+      if (!normalizedRequests.length) {
+        return new Response(JSON.stringify({ error: "No valid skills provided." }), { status: 400, headers });
+      }
+
+      const responses = [];
+      for (const requestEntry of normalizedRequests) {
+        const result = await executeCoachRequest(env, requestEntry, { defaultHint: "coach-roleplay" });
+        responses.push(result);
+      }
+
+      const meta = {
+        run_id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        writer_model: env.WRITER_MODEL || "openai/gpt-4o-mini",
+        provider_order: providerPrefs(env).order,
+        requested_skills: normalizedRequests.map((entry) => entry.skillName),
+        mode: "coach-only",
+        count: responses.length,
+      };
+
+      return new Response(JSON.stringify({ assessments: responses, skills: responses, meta }), { headers });
+    }
+
+    const normalizedSingle = normalizeCoachRequestPayload(body, body);
+    if (!normalizedSingle) {
       return new Response(JSON.stringify({ error: "Missing 'skill' in request body." }), { status: 400, headers });
     }
 
-    const ratingCandidates = [body?.rating, body?.score, analysis?.rating, analysis?.score];
-    let rating = null;
-    for (const candidate of ratingCandidates) {
-      const value = Number(candidate);
-      if (Number.isFinite(value)) {
-        rating = value;
-        break;
-      }
-    }
-
-    const levelChecksRaw =
-      Array.isArray(body?.level_checks)
-        ? body.level_checks
-        : Array.isArray(body?.levelChecks)
-        ? body.levelChecks
-        : Array.isArray(analysis?.level_checks)
-        ? analysis.level_checks
-        : Array.isArray(analysis?.levelChecks)
-        ? analysis.levelChecks
-        : null;
-
-    const levelChecks = Array.isArray(levelChecksRaw) ? levelChecksRaw : null;
-    const providedStrengths =
-      Array.isArray(body?.strengths)
-        ? body.strengths
-        : Array.isArray(analysis?.strengths)
-        ? analysis.strengths
-        : null;
-    const providedImprovements =
-      Array.isArray(body?.improvements)
-        ? body.improvements
-        : Array.isArray(analysis?.improvements)
-        ? analysis.improvements
-        : Array.isArray(analysis?.improvement_opportunities)
-        ? analysis.improvement_opportunities
-        : null;
-
-    const strengthFallback = levelChecks
-      ? collectStrengthCandidates(levelChecks)
-          .slice(0, 6)
-          .map((item) => ({
-            level: item.level,
-            characteristic: item.characteristic,
-            quote: pickQuote(item.evidence),
-          }))
-      : [];
-    const improvementFallback = levelChecks
-      ? collectImprovementSeeds(levelChecks)
-          .slice(0, 8)
-          .map((item) => ({
-            level: item.level,
-            characteristic: item.characteristic,
-            quote: pickQuote(item.evidence),
-            reason: item.reason,
-          }))
-      : [];
-
-    const strengthsSnapshot = normalizeCoachStrengths(providedStrengths, strengthFallback);
-    const improvementSnapshot = normalizeCoachImprovements(providedImprovements, improvementFallback);
-
-    if (!Number.isFinite(rating) && levelChecks) {
-      rating = computeRating(levelChecks);
-    }
-
-    const ratingForPrompt = Number.isFinite(rating) ? rating : 0;
-
-    const feedback = await generateCoachingFeedback(
-      env,
-      skillName,
-      ratingForPrompt,
-      strengthsSnapshot,
-      improvementSnapshot,
-      { hint: "coach-roleplay" }
-    );
-
-    const responsePayload = {
-      skill: skillName,
-      rating: Number.isFinite(rating) ? rating : null,
-      strengths: feedback.strengths,
-      improvements: feedback.improvements,
-      coaching_tips: feedback.coaching_tips,
-      _served_by: { coach: feedback.servedBy || null },
-      _prompts: { coach_chars: feedback.promptChars },
-      meta: {
-        provided_level_checks: levelChecks ? levelChecks.length : 0,
-        input_strengths: Array.isArray(providedStrengths) ? providedStrengths.length : 0,
-        input_improvements: Array.isArray(providedImprovements) ? providedImprovements.length : 0,
-      },
-    };
-
+    const responsePayload = await executeCoachRequest(env, normalizedSingle, { defaultHint: "coach-roleplay" });
     return new Response(JSON.stringify(responsePayload), { headers });
   } catch (error) {
     return new Response(JSON.stringify({ error: error.message }), { status: 500, headers });
